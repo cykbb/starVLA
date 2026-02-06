@@ -1,0 +1,7 @@
+framework:
+  name: QwenPI_PaDT
+  vrt_loss_weight: 0.1      # VRT 损失权重
+  action_loss_weight: 1.0   # 动作损失权重
+  qwenvl:
+    base_vlm: "Qwen2.5-VL-3B-Instruct"
+    vl_hidden_dim: 768

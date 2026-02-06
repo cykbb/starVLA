@@ -16,6 +16,7 @@ from starVLA.dataloader.gr00t_lerobot.embodiment_tags import ROBOT_TYPE_TO_EMBOD
 def collate_fn(batch):
     return batch
 
+# 创建单个数据集
 def make_LeRobotSingleDataset(
     data_root_dir: Path | str,
     data_name: str,

@@ -180,6 +180,7 @@ class LeRobotSingleDataset(Dataset):
         self._video_path_pattern = self._get_video_path_pattern()
         self._chunk_size = self._get_chunk_size()
         self._tasks = self._get_tasks()
+        self._answers = self._get_answers()  # Load conversation-based annotations
         # self._episodes = self._get_episode_info() # TODO why we need this func
         self.curr_traj_data = None
         self.curr_traj_id = None
@@ -287,6 +288,11 @@ class LeRobotSingleDataset(Dataset):
     def tasks(self) -> pd.DataFrame:
         """The tasks for the dataset."""
         return self._tasks
+
+    @property
+    def answers(self) -> pd.DataFrame:
+        """The conversation-based object detection answers for the dataset."""
+        return self._answers
 
     def _get_metadata(self, embodiment_tag: EmbodimentTag) -> DatasetMetadata:
         """Get the metadata for the dataset.
@@ -747,6 +753,29 @@ class LeRobotSingleDataset(Dataset):
             df = df.rename(columns={'index': 'task'})  # 把 'index' 列重命名为 'task'
             df = df[['task_index', 'task']]  # 调整列顺序
             return df
+    
+    def _get_answers(self) -> pd.DataFrame:
+        """Get the answers (conversation-based object detection annotations) for the dataset."""
+        answers_path = self.dataset_path / "meta" / "answers.jsonl"
+        
+        # 如果文件不存在，返回空 DataFrame
+        if not answers_path.exists():
+            print(f"Warning: answers.jsonl not found at {answers_path}, returning empty DataFrame")
+            return pd.DataFrame()
+        
+        with open(answers_path, "r") as f:
+            answers = [json.loads(line) for line in f]
+        
+        df = pd.DataFrame(answers)
+        
+        # 如果有 task_index，使用它作为索引；否则用行号
+        if "task_index" in df.columns:
+            return df.set_index("task_index")
+        else:
+            # 为每一行添加索引（对应 tasks.jsonl 的顺序）
+            df.index.name = "task_index"
+            return df
+    
     def _check_integrity(self):
         """Use the config to check if the keys are valid and detect silent data corruption."""
         ERROR_MSG_HEADER = f"Error occurred in initializing dataset {self.dataset_name}:\n"
@@ -755,6 +784,9 @@ class LeRobotSingleDataset(Dataset):
             for key in modality_config.modality_keys:
                 if key == "lapa_action" or key == "dream_actions":
                     continue  # no need for any metadata for lapa actions because it comes normalized
+                # segmentation.* 不在 lerobot modality metadata 中，直接跳过校验
+                if key.startswith("segmentation."):
+                    continue
                 # Check if the key is valid
                 try:
                     self.lerobot_modality_meta.get_key_meta(key)
@@ -1145,6 +1177,30 @@ class LeRobotSingleDataset(Dataset):
             task_indices.append(value if isinstance(value, (int, float)) else value.item())
 
         return self.tasks.loc[task_indices]["task"].tolist()
+    
+    def get_segmentation(
+        self,
+        trajectory_id: int,
+        key: str,
+        base_index: int,
+    ) -> list[dict]:
+        """获取 segmentation 数据（已解析的 JSON 字典）"""
+        import json
+        
+        traj_data = self.get_trajectory_data(trajectory_id)
+        delta_indices = self.delta_indices[key]
+        step_indices = base_index + delta_indices
+        
+        seg_data_list = []
+        for idx in step_indices:
+            if 0 <= idx < len(traj_data):
+                json_str = traj_data.iloc[idx][key]
+                seg_dict = json.loads(json_str) if isinstance(json_str, str) else json_str
+                seg_data_list.append(seg_dict)
+            else:
+                seg_data_list.append({})  # padding
+        
+        return seg_data_list
 
     def get_data_by_modality(
         self,
@@ -1171,6 +1227,8 @@ class LeRobotSingleDataset(Dataset):
             return self.get_state_or_action(trajectory_id, modality, key, base_index)
         elif modality == "language":
             return self.get_language(trajectory_id, key, base_index)
+        elif modality == "segmentation":
+            return self.get_segmentation(trajectory_id, key, base_index)
         else:
             raise ValueError(f"Invalid modality: {modality}")
 

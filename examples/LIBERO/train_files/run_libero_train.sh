@@ -10,14 +10,14 @@ export NCCL_TIMEOUT=10000  # timeout set to 1 hour (unit: seconds)
 export NCCL_SOCKET_TIMEOUT_MS=360000
 ###########################################################################################
 # === Please modify the following paths according to your environment ===
-Framework_name=QwenOFT
+Framework_name=QwenPI
 freeze_module_list=''
-base_vlm=playground/Pretrained_models/Qwen3-VL-4B-Instruct
-config_yaml=./examples/LIBERO/train_files/starvla_cotrain_libero.yaml
+base_vlm=playground/Pretrained_models/Qwen2.5-VL-3B-Instruct
+config_yaml=./examples/LIBERO/train_files/starvla_libero_vla_only.yaml
 libero_data_root=playground/Datasets/LEROBOT_LIBERO_DATA
 data_mix=libero_all
 run_root_dir=./results/Checkpoints
-run_id=1229_libero4in1_qwen3oft
+run_id=qwenpi_libero_vla_only
 # === End of environment variable configuration ===
 ###########################################################################################
 
@@ -42,14 +42,18 @@ accelerate launch \
   --datasets.vla_data.per_device_batch_size 16 \
   --trainer.vla_data.video_backend torchvision_av \
   --trainer.freeze_modules ${freeze_module_list} \
-  --trainer.max_train_steps 80000 \
-  --trainer.save_interval 10000 \
+  # --trainer.max_train_steps 80000 \
+  # --trainer.save_interval 10000 \
+  # --trainer.logging_frequency 100 \
+  # --trainer.eval_interval 100 \
+  --trainer.max_train_steps 30000 \
+  --trainer.save_interval 5000 \
   --trainer.logging_frequency 100 \
-  --trainer.eval_interval 100 \
+  --trainer.eval_interval 1000 \
   --run_root_dir ${run_root_dir} \
   --run_id ${run_id} \
   --wandb_project starVLA_Libero \
-  --wandb_entity jinhuiye \
+  --wandb_entity bykkk-nanyang-technological-university-singapore-org \
   # --is_debug True
 
 
@@ -71,3 +75,4 @@ accelerate launch \
   #   --wandb_project your_project \
   #   --wandb_entity your_name
 ##### Multi-Server Multi-GPU training script #####
+

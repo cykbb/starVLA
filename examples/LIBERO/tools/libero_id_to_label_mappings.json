@@ -1,0 +1,346 @@
+{
+  "libero_spatial": {
+    "0": {
+      "1": "akita black bowl",
+      "2": "akita black bowl",
+      "3": "cookies",
+      "4": "glazed rim porcelain ramekin",
+      "5": "plate",
+      "6": "wooden cabinet",
+      "7": "flat stove"
+    },
+    "1": {
+      "1": "akita black bowl",
+      "2": "akita black bowl",
+      "3": "cookies",
+      "4": "glazed rim porcelain ramekin",
+      "5": "plate",
+      "6": "wooden cabinet",
+      "7": "flat stove"
+    },
+    "2": {
+      "1": "akita black bowl",
+      "2": "akita black bowl",
+      "3": "cookies",
+      "4": "glazed rim porcelain ramekin",
+      "5": "plate",
+      "6": "wooden cabinet",
+      "7": "flat stove"
+    },
+    "3": {
+      "1": "akita black bowl",
+      "2": "akita black bowl",
+      "3": "cookies",
+      "4": "glazed rim porcelain ramekin",
+      "5": "plate",
+      "6": "wooden cabinet",
+      "7": "flat stove"
+    },
+    "4": {
+      "1": "akita black bowl",
+      "2": "akita black bowl",
+      "3": "cookies",
+      "4": "glazed rim porcelain ramekin",
+      "5": "plate",
+      "6": "wooden cabinet",
+      "7": "flat stove"
+    },
+    "5": {
+      "1": "akita black bowl",
+      "2": "akita black bowl",
+      "3": "cookies",
+      "4": "glazed rim porcelain ramekin",
+      "5": "plate",
+      "6": "wooden cabinet",
+      "7": "flat stove"
+    },
+    "6": {
+      "1": "akita black bowl",
+      "2": "akita black bowl",
+      "3": "cookies",
+      "4": "glazed rim porcelain ramekin",
+      "5": "plate",
+      "6": "wooden cabinet",
+      "7": "flat stove"
+    },
+    "7": {
+      "1": "akita black bowl",
+      "2": "akita black bowl",
+      "3": "cookies",
+      "4": "glazed rim porcelain ramekin",
+      "5": "plate",
+      "6": "wooden cabinet",
+      "7": "flat stove"
+    },
+    "8": {
+      "1": "akita black bowl",
+      "2": "akita black bowl",
+      "3": "cookies",
+      "4": "glazed rim porcelain ramekin",
+      "5": "plate",
+      "6": "wooden cabinet",
+      "7": "flat stove"
+    },
+    "9": {
+      "1": "akita black bowl",
+      "2": "akita black bowl",
+      "3": "cookies",
+      "4": "glazed rim porcelain ramekin",
+      "5": "plate",
+      "6": "wooden cabinet",
+      "7": "flat stove"
+    }
+  },
+  "libero_goal": {
+    "0": {
+      "1": "akita black bowl",
+      "2": "cream cheese",
+      "3": "wine bottle",
+      "4": "plate",
+      "5": "wooden cabinet",
+      "6": "flat stove",
+      "7": "wine rack"
+    },
+    "1": {
+      "1": "akita black bowl",
+      "2": "cream cheese",
+      "3": "wine bottle",
+      "4": "plate",
+      "5": "wooden cabinet",
+      "6": "flat stove",
+      "7": "wine rack"
+    },
+    "2": {
+      "1": "akita black bowl",
+      "2": "cream cheese",
+      "3": "wine bottle",
+      "4": "plate",
+      "5": "wooden cabinet",
+      "6": "flat stove",
+      "7": "wine rack"
+    },
+    "3": {
+      "1": "akita black bowl",
+      "2": "cream cheese",
+      "3": "wine bottle",
+      "4": "plate",
+      "5": "wooden cabinet",
+      "6": "flat stove",
+      "7": "wine rack"
+    },
+    "4": {
+      "1": "akita black bowl",
+      "2": "cream cheese",
+      "3": "wine bottle",
+      "4": "plate",
+      "5": "wooden cabinet",
+      "6": "flat stove",
+      "7": "wine rack"
+    },
+    "5": {
+      "1": "akita black bowl",
+      "2": "cream cheese",
+      "3": "wine bottle",
+      "4": "plate",
+      "5": "wooden cabinet",
+      "6": "flat stove",
+      "7": "wine rack"
+    },
+    "6": {
+      "1": "akita black bowl",
+      "2": "cream cheese",
+      "3": "wine bottle",
+      "4": "plate",
+      "5": "wooden cabinet",
+      "6": "flat stove",
+      "7": "wine rack"
+    },
+    "7": {
+      "1": "akita black bowl",
+      "2": "cream cheese",
+      "3": "wine bottle",
+      "4": "plate",
+      "5": "wooden cabinet",
+      "6": "flat stove",
+      "7": "wine rack"
+    },
+    "8": {
+      "1": "akita black bowl",
+      "2": "cream cheese",
+      "3": "wine bottle",
+      "4": "plate",
+      "5": "wooden cabinet",
+      "6": "flat stove",
+      "7": "wine rack"
+    },
+    "9": {
+      "1": "akita black bowl",
+      "2": "cream cheese",
+      "3": "wine bottle",
+      "4": "plate",
+      "5": "wooden cabinet",
+      "6": "flat stove",
+      "7": "wine rack"
+    }
+  },
+  "libero_object": {
+    "0": {
+      "1": "alphabet soup",
+      "2": "basket",
+      "3": "salad dressing",
+      "4": "cream cheese",
+      "5": "milk",
+      "6": "tomato sauce",
+      "7": "butter"
+    },
+    "1": {
+      "1": "cream cheese",
+      "2": "basket",
+      "3": "alphabet soup",
+      "4": "milk",
+      "5": "tomato sauce",
+      "6": "butter",
+      "7": "orange juice"
+    },
+    "2": {
+      "1": "salad dressing",
+      "2": "basket",
+      "3": "ketchup",
+      "4": "alphabet soup",
+      "5": "cream cheese",
+      "6": "milk",
+      "7": "tomato sauce"
+    },
+    "3": {
+      "1": "bbq sauce",
+      "2": "basket",
+      "3": "chocolate pudding",
+      "4": "ketchup",
+      "5": "salad dressing",
+      "6": "alphabet soup",
+      "7": "cream cheese"
+    },
+    "4": {
+      "1": "ketchup",
+      "2": "basket",
+      "3": "bbq sauce",
+      "4": "salad dressing",
+      "5": "alphabet soup",
+      "6": "cream cheese",
+      "7": "milk"
+    },
+    "5": {
+      "1": "tomato sauce",
+      "2": "basket",
+      "3": "milk",
+      "4": "butter",
+      "5": "orange juice",
+      "6": "chocolate pudding",
+      "7": "bbq sauce"
+    },
+    "6": {
+      "1": "butter",
+      "2": "basket",
+      "3": "tomato sauce",
+      "4": "orange juice",
+      "5": "chocolate pudding",
+      "6": "bbq sauce",
+      "7": "ketchup"
+    },
+    "7": {
+      "1": "milk",
+      "2": "basket",
+      "3": "cream cheese",
+      "4": "tomato sauce",
+      "5": "butter",
+      "6": "orange juice",
+      "7": "chocolate pudding"
+    },
+    "8": {
+      "1": "chocolate pudding",
+      "2": "basket",
+      "3": "orange juice",
+      "4": "bbq sauce",
+      "5": "ketchup",
+      "6": "salad dressing",
+      "7": "alphabet soup"
+    },
+    "9": {
+      "1": "orange juice",
+      "2": "basket",
+      "3": "butter",
+      "4": "chocolate pudding",
+      "5": "bbq sauce",
+      "6": "ketchup",
+      "7": "salad dressing"
+    }
+  },
+  "libero_10": {
+    "0": {
+      "1": "alphabet soup",
+      "2": "cream cheese",
+      "3": "tomato sauce",
+      "4": "ketchup",
+      "5": "orange juice",
+      "6": "milk",
+      "7": "butter",
+      "8": "basket"
+    },
+    "1": {
+      "1": "alphabet soup",
+      "2": "cream cheese",
+      "3": "tomato sauce",
+      "4": "ketchup",
+      "5": "orange juice",
+      "6": "milk",
+      "7": "butter",
+      "8": "basket"
+    },
+    "2": {
+      "1": "chefmate 8 frypan",
+      "2": "moka pot",
+      "3": "flat stove"
+    },
+    "3": {
+      "1": "akita black bowl",
+      "2": "wine bottle",
+      "3": "white cabinet",
+      "4": "wine rack"
+    },
+    "4": {
+      "1": "porcelain mug",
+      "2": "red coffee mug",
+      "3": "white yellow mug",
+      "4": "plate",
+      "5": "plate"
+    },
+    "5": {
+      "1": "black book",
+      "2": "white yellow mug",
+      "3": "desk caddy"
+    },
+    "6": {
+      "1": "porcelain mug",
+      "2": "red coffee mug",
+      "3": "plate",
+      "4": "chocolate pudding"
+    },
+    "7": {
+      "1": "alphabet soup",
+      "2": "cream cheese",
+      "3": "tomato sauce",
+      "4": "ketchup",
+      "5": "basket"
+    },
+    "8": {
+      "1": "moka pot",
+      "2": "moka pot",
+      "3": "flat stove"
+    },
+    "9": {
+      "1": "porcelain mug",
+      "2": "white yellow mug",
+      "3": "microwave"
+    }
+  }
+}

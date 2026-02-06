@@ -258,6 +258,8 @@ def _get_libero_env(task, resolution, seed):
         "bddl_file_name": task_bddl_file,
         "camera_heights": resolution,
         "camera_widths": resolution,
+        "camera_names": ["agentview", "robot0_eye_in_hand"],
+        "camera_segmentations": "instance",
     }
     env = OffScreenRenderEnv(**env_args)
     env.seed(

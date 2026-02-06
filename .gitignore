@@ -203,6 +203,9 @@ test_image.jpg.npy
 test_image.jpg
 # scripts/*
 
+# Test outputs
+test_segmentation_output/
+
 scripts/run_scripts/sum2cluter.sh
 
 examples/SimplerEnv/eval_scripts
@@ -213,6 +216,8 @@ starVLA/config/frameworks/*
 starVLA/model/modules/sam_model/*
 assets/SAMv2.txt
 playground/*
+# Allow specific demo data
+!playground/demo_data/
 qwen_talk.md
 assets/R1Pro.py
 examples/SPVLA
@@ -221,3 +226,16 @@ examples/Robotwin/train_files/submit_robotwin_training.sh
 starVLA/dataloader/gr00t_lerobot/datasets_temp.py
 MUJOCO_LOG.TXT
 examples/MultiRobot/*
+
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.err
+*.out
+results/
+logs/
+wandb/
+original_images/

@@ -462,6 +462,10 @@ class Libero4in1DataConfig:
     ]
     
     language_keys = ["annotation.human.action.task_description"]
+    
+    segmentation_keys = [
+    "segmentation.agentview_bbox_mask",
+    "segmentation.wrist_bbox_mask",]
 
     observation_indices = [0]
     action_indices = list(range(8))
@@ -484,11 +488,16 @@ class Libero4in1DataConfig:
             delta_indices=self.observation_indices,
             modality_keys=self.language_keys,
         )
+        segmentation_modality = ModalityConfig(
+            delta_indices=self.observation_indices,  # 与 video 相同，只取当前帧
+            modality_keys=self.segmentation_keys,
+        )
         modality_configs = {
             "video": video_modality,
             "state": state_modality,
             "action": action_modality,
             "language": language_modality,
+            "segmentation": segmentation_modality,
         }
         return modality_configs
 
