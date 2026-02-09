@@ -12,6 +12,8 @@ from typing import Dict, Optional, List
 from torch.nn.utils.rnn import pad_sequence
 from transformers import BatchFeature
 
+from starVLA.model.modules.PaDT.models import VisonTextProcessingClass
+
 from qwen_vl_utils import process_vision_info
 
 try:
@@ -95,6 +97,14 @@ class _PaDT_VL_Interface(nn.Module):
         )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
+
+        # Wrap processor to support VRT tokens and pid2vrt helpers
+        processor = VisonTextProcessingClass(
+            processor,
+            getattr(model.config.vision_config, "spatial_merge_size", 2),
+        )
+        # Align tokenizer vocab with model embedding size
+        processor.prepare(model.get_input_embeddings().weight.shape[0])
 
         self.model = model
         self.processor = processor

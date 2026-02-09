@@ -848,11 +848,20 @@ class LeRobotSingleDataset(Dataset):
         # Prepare return dict
         result = dict(action=action, image=images, language=language)
         
-        # Add segmentation data if available
+        # Add segmentation data if available (merge multiple views into a single list of dicts)
         if "segmentation" in self.modality_keys and len(self.modality_keys["segmentation"]) > 0:
-            seg_key = self.modality_keys["segmentation"][0]
-            seg_data = data[seg_key]
-            result["seg"] = seg_data
+            seg_keys = self.modality_keys["segmentation"]
+            seg_lists = [data[k] for k in seg_keys]
+            if seg_lists:
+                merged_seg = []
+                for idx in range(len(seg_lists[0])):
+                    view_dict = {}
+                    for k, seg_list in zip(seg_keys, seg_lists):
+                        view_name = k.replace("segmentation.", "")
+                        seg_item = seg_list[idx]
+                        view_dict[view_name] = json.loads(seg_item) if isinstance(seg_item, str) else seg_item
+                    merged_seg.append(view_dict)
+                result["seg"] = merged_seg
         
         # Add answers data if available
         if not self.answers.empty and self.curr_traj_data is not None:
@@ -1806,12 +1815,21 @@ class LeRobotMixtureDataset(Dataset):
                 # Prepare return dict
                 result = dict(action=action, image=all_images, language=language)
                 
-                # Add segmentation data if configured
+                # Add segmentation data if configured (merge multi-view into per-step dict)
                 if self.data_cfg is not None and self.data_cfg.get("include_segmentation", False) not in ["False", False]:
                     if "segmentation" in dataset.modality_keys and len(dataset.modality_keys["segmentation"]) > 0:
-                        seg_key = dataset.modality_keys["segmentation"][0]
-                        seg_data = data[seg_key]
-                        result["seg"] = seg_data
+                        seg_keys = dataset.modality_keys["segmentation"]
+                        seg_lists = [data[k] for k in seg_keys]
+                        if seg_lists:
+                            merged_seg = []
+                            for idx in range(len(seg_lists[0])):
+                                view_dict = {}
+                                for k, seg_list in zip(seg_keys, seg_lists):
+                                    view_name = k.replace("segmentation.", "")
+                                    seg_item = seg_list[idx]
+                                    view_dict[view_name] = json.loads(seg_item) if isinstance(seg_item, str) else seg_item
+                                merged_seg.append(view_dict)
+                            result["seg"] = merged_seg
                 
                 # Add answers data if configured
                 if self.data_cfg is not None and self.data_cfg.get("include_answers", False) not in ["False", False]:

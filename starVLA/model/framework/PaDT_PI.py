@@ -27,6 +27,7 @@ IGNORE_INDEX = -100
 
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
+from starVLA.model.modules.vlm.padt import PaDTForConditionalGeneration
 from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import get_action_model, LayerwiseFlowmatchingActionHead
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
@@ -64,6 +65,8 @@ class PaDT_PI(baseframework):
         super().__init__()
         self.config = config
         self.padt_vl_interface = get_vlm_model(config=self.config)
+        model_cls = PaDTForConditionalGeneration
+        
 
         # dynamic get llm config
         num_vl_layers, llm_hidden_size = 36, self.padt_vl_interface.model.config.hidden_size
@@ -96,6 +99,9 @@ class PaDT_PI(baseframework):
         """
         import json
         import re
+        import random
+
+        processor = self.padt_vl_interface.processor
         
         # 检查是否有 answers 数据
         if "answers" not in examples[0]:
@@ -116,8 +122,8 @@ class PaDT_PI(baseframework):
                 prompt = [{"role": "user", "content": conversation["value"]}]
                 prompts.append(prompt)
                 
-                # 使用 answer_template 作为 completion
-                completion = answers_data.get("answer_template", "")
+                # 使用 answer_template 作为 completion（后续用 VRT 替换 <|Obj_x|>）
+                completion_raw = answers_data.get("answer_template", "")
                 
                 # 从 segmentation 数据中提取物体信息
                 objects_info = {}
@@ -131,7 +137,7 @@ class PaDT_PI(baseframework):
                     
                     # 从 completion 中提取引用的物体编号
                     pattern = r'<\|Obj_(\d+)\|>'
-                    obj_indices = re.findall(pattern, completion)
+                    obj_indices = re.findall(pattern, completion_raw)
                     
                     # 为每个引用的物体收集来自不同视角的信息
                     for obj_idx in obj_indices:
@@ -161,6 +167,45 @@ class PaDT_PI(baseframework):
                                 objects_info[obj_idx] = obj_info_list
                 
                 # 构建 solution 数据结构
+                # 将 <|Obj_x|> 替换为 VRT token（使用 patches 信息）
+                def _obj_to_vrt(match: re.Match) -> str:
+                    obj_idx = match.group(1)
+                    view_infos = objects_info.get(obj_idx, [])
+                    # 保留有 patch 的视角
+                    view_infos = [v for v in view_infos if v.get('patches')]
+                    if not view_infos:
+                        return match.group(0)
+
+                    # 视角优先级：agent/third/ego -> wrist/hand -> 其他
+                    ordered: list[dict] = []
+                    def _append_by_substring(subs: list[str]):
+                        for sub in subs:
+                            for v in view_infos:
+                                if sub in v.get('view', '') and v not in ordered:
+                                    ordered.append(v)
+                    _append_by_substring(["agent", "third", "ego"])
+                    _append_by_substring(["wrist", "hand"])
+                    for v in view_infos:
+                        if v not in ordered:
+                            ordered.append(v)
+
+                    picked: list[int] = []
+                    sample_n = 3
+                    for v in ordered:
+                        patches = [int(p) for p in v.get('patches', []) or []]
+                        if not patches:
+                            continue
+                        if len(patches) < sample_n:
+                            picked.extend([random.choice(patches) for _ in range(sample_n)])
+                        else:
+                            picked.extend(random.sample(patches, sample_n))
+
+                    if not picked:
+                        return match.group(0)
+                    return processor.pid2vrt(picked)
+
+                completion = re.sub(r'<\|Obj_(\d+)\|>', _obj_to_vrt, completion_raw)
+
                 solution = {
                     'text': completion,
                     'objects': objects_info
@@ -217,6 +262,10 @@ class PaDT_PI(baseframework):
         # Concatenate for full sequence
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+
+        # 重新映射 VRT token 到全局 ID（与 PaDT 训练对齐）
+        if prompt_inputs.get('image_grid_thw') is not None:
+            input_ids = processor.assign_to_global_vrt_id(input_ids, prompt_inputs['image_grid_thw'])
         
         # Prepare multimodal inputs
         multimodal_inputs = {
@@ -266,7 +315,7 @@ class PaDT_PI(baseframework):
                 vlm_loss (torch.Tensor, optional): VLM language modeling loss.
         """
         batch_images = [example["image"] for example in examples]
-        instructions = [example["lang"] for example in examples]  # [B, str]
+        instructions = [example.get("lang", example.get("language")) for example in examples]  # [B, str]
         # print(f"instruction: {instructions[0]}")
         actions = [example["action"] for example in examples]  # label [B， len, 7]
         
