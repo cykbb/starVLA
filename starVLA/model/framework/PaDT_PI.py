@@ -77,9 +77,179 @@ class PaDT_PI(baseframework):
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         
 
+    def compute_vlm_loss(
+        self,
+        examples: List[dict],
+        batch_images: List[List[Image.Image]],
+        instructions: List[str],
+    ) -> torch.Tensor:
+        """
+        Compute VLM loss based on answers and segmentation data.
+        
+        Args:
+            examples: List[dict] containing answers and segmentation data
+            batch_images: List of image lists [B, [PIL.Image]]
+            instructions: List of instruction strings [B]
+            
+        Returns:
+            vlm_loss: torch.Tensor, language modeling loss
+        """
+        import json
+        import re
+        
+        # 检查是否有 answers 数据
+        if "answers" not in examples[0]:
+            return None
+            
+        # 构建 prompt 和 completion，并准备 solutions（用于 bbox 等信息）
+        prompts = []
+        completions = []
+        solutions = []
+        
+        for example in examples:
+            answers_data = example["answers"]
+            
+            # 从 answers 中提取对话
+            if "conversations" in answers_data and len(answers_data["conversations"]) > 0:
+                # 使用对话作为 prompt
+                conversation = answers_data["conversations"][0]
+                prompt = [{"role": "user", "content": conversation["value"]}]
+                prompts.append(prompt)
+                
+                # 使用 answer_template 作为 completion
+                completion = answers_data.get("answer_template", "")
+                
+                # 从 segmentation 数据中提取物体信息
+                objects_info = {}
+                if "seg" in example and len(example["seg"]) > 0:
+                    # 获取第一帧的 segmentation 数据
+                    seg_data = example["seg"][0]
+                    
+                    # 解析 segmentation 数据（如果是字符串需要解析）
+                    if isinstance(seg_data, str):
+                        seg_data = json.loads(seg_data)
+                    
+                    # 从 completion 中提取引用的物体编号
+                    pattern = r'<\|Obj_(\d+)\|>'
+                    obj_indices = re.findall(pattern, completion)
+                    
+                    # 为每个引用的物体收集来自不同视角的信息
+                    for obj_idx in obj_indices:
+                        if obj_idx not in objects_info:
+                            obj_info_list = []
+                            
+                            # 检查每个视角的 segmentation 数据
+                            for seg_key, seg_value in seg_data.items():
+                                if isinstance(seg_value, str):
+                                    seg_value = json.loads(seg_value)
+                                
+                                # 如果该视角中有这个物体
+                                if obj_idx in seg_value:
+                                    obj_data = seg_value[obj_idx]
+                                    obj_info = {
+                                        'bbox': obj_data.get('bbox', []),
+                                        'patches': obj_data.get('patches', []),
+                                        'label': obj_data.get('label', ''),
+                                        'view': seg_key  # 标记来自哪个视角
+                                    }
+                                    if 'mask' in obj_data:
+                                        obj_info['rle'] = obj_data['mask']
+                                    obj_info_list.append(obj_info)
+                            
+                            # 如果找到了该物体的信息（可能来自1-2个视角）
+                            if obj_info_list:
+                                objects_info[obj_idx] = obj_info_list
+                
+                # 构建 solution 数据结构
+                solution = {
+                    'text': completion,
+                    'objects': objects_info
+                }
+                solutions.append(solution)
+                completions.append(completion)
+            else:
+                # 如果没有对话数据，跳过
+                return None
+        
+        # 使用 padt_vl_interface 的 tokenizer 处理
+        prompt_texts = [self.padt_vl_interface.processor.apply_chat_template(
+            prompt, tokenize=False, add_generation_prompt=True
+        ) for prompt in prompts]
+        
+        # 使用所有视角的图片（和padt.py的forward逻辑一致）
+        # batch_images: List[List[PIL.Image]], 展平为一维列表供processor处理
+        from qwen_vl_utils import process_vision_info
+        
+        # 构建messages用于process_vision_info
+        messages_for_vision = []
+        for imgs in batch_images:
+            content = [{"type": "image", "image": img} for img in imgs]
+            messages_for_vision.append([{"role": "user", "content": content}])
+        
+        image_inputs, _ = process_vision_info(messages_for_vision)
+        
+        # Tokenize prompts with images
+        prompt_inputs = self.padt_vl_interface.processor(
+            text=prompt_texts,
+            images=image_inputs,
+            return_tensors='pt',
+            padding=True,
+            padding_side='left',
+            add_special_tokens=False
+        )
+        prompt_inputs = {k: v.to(self.padt_vl_interface.model.device) for k, v in prompt_inputs.items()}
+        prompt_ids = prompt_inputs["input_ids"]
+        prompt_mask = prompt_inputs["attention_mask"]
+        prompt_length = prompt_ids.size(1)
+        
+        # Tokenize completions
+        completion_inputs = self.padt_vl_interface.processor(
+            text=completions,
+            return_tensors='pt',
+            padding=True,
+            padding_side='right',
+            add_special_tokens=False
+        )
+        completion_inputs = {k: v.to(self.padt_vl_interface.model.device) for k, v in completion_inputs.items()}
+        completion_ids = completion_inputs["input_ids"]
+        completion_mask = completion_inputs["attention_mask"]
+        
+        # Concatenate for full sequence
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        
+        # Prepare multimodal inputs
+        multimodal_inputs = {
+            'image_grid_thw': prompt_inputs.get('image_grid_thw'),
+            'pixel_values': prompt_inputs.get('pixel_values')
+        }
+        
+        # Forward pass
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            model_output = self.padt_vl_interface.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **multimodal_inputs
+            )
+        
+        # Compute token loss
+        logits = model_output.logits[:, prompt_length-1:-1, :]  # (B, L, V)
+        target_ids = input_ids[:, prompt_length:]  # (B, L)
+        
+        # Calculate cross-entropy loss
+        logit_log_probs = F.log_softmax(logits, dim=-1)
+        token_log_prob = torch.gather(logit_log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+        per_token_loss = -token_log_prob
+        
+        # Average over valid tokens
+        vlm_loss = ((per_token_loss * completion_mask).sum(dim=-1) / (completion_mask.sum(dim=-1) + 1e-4)).mean()
+        
+        return vlm_loss
+
     def forward(
         self,
         examples: List[dict] = None,
+        compute_vlm_loss: bool = False,
         **kwargs,
     ) -> Tuple:
         """
@@ -88,21 +258,25 @@ class PaDT_PI(baseframework):
                 - image: List[PIL.Image] (multi-view)
                 - lang: str instruction
                 - action: np.ndarray or list shaped [T, action_dim]
+                - solution: str (optional, for VLM training)
+            compute_vlm_loss: bool, whether to compute VLM loss
         Returns:
             dict:
                 action_loss (torch.Tensor): Scalar diffusion noise prediction loss.
+                vlm_loss (torch.Tensor, optional): VLM language modeling loss.
         """
         batch_images = [example["image"] for example in examples]
-        # agent_images = [[example["image"][0]] for example in examples]  #  [B, [Primary Camera only]] - 只使用第三视角
         instructions = [example["lang"] for example in examples]  # [B, str]
         # print(f"instruction: {instructions[0]}")
         actions = [example["action"] for example in examples]  # label [B， len, 7]
         
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
         
-
-        # Step 1: QWenVL input format
-        padt_inputs = self.padt_vl_interface.build_padtvl_inputs(images=batch_images, instructions=instructions)
+        # Step 1: QWenVL input format (for action prediction, no solutions needed)
+        padt_inputs = self.padt_vl_interface.build_padtvl_inputs(
+            images=batch_images, 
+            instructions=instructions,
+        )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             padt_outputs = self.padt_vl_interface(
                 **padt_inputs,
@@ -141,9 +315,16 @@ class PaDT_PI(baseframework):
 
             action_loss = self.action_model(vl_embs_list_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
 
-
-
-        return {"action_loss": action_loss}
+        # 构建返回字典
+        output_dict = {"action_loss": action_loss}
+        
+        # 计算 VLM loss（如果需要且数据可用）
+        if compute_vlm_loss:
+            vlm_loss = self.compute_vlm_loss(examples, batch_images, instructions)
+            if vlm_loss is not None:
+                output_dict["vlm_loss"] = vlm_loss
+        
+        return output_dict
 
 
 

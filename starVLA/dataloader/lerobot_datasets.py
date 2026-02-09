@@ -35,7 +35,9 @@ def make_LeRobotSingleDataset(
     """
     
     data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
+    # 决定 sample 里的字段
     modality_config = data_config.modality_config()
+    # 决定这些字段会被怎样处理
     transforms = data_config.transform()
     dataset_path = data_root_dir / data_name
     if robot_type not in ROBOT_TYPE_TO_EMBODIMENT_TAG:
@@ -43,7 +45,7 @@ def make_LeRobotSingleDataset(
         embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
     else:
         embodiment_tag = ROBOT_TYPE_TO_EMBODIMENT_TAG[robot_type]
-    
+    # 图像来自视频帧
     video_backend = data_cfg.get("video_backend", "decord") if data_cfg else "decord"
     
     return LeRobotSingleDataset(
@@ -52,7 +54,7 @@ def make_LeRobotSingleDataset(
         transforms=transforms,
         embodiment_tag=embodiment_tag,
         video_backend=video_backend, # decord is more efficiency | torchvision_av for video.av1
-        delete_pause_frame=delete_pause_frame,
+        delete_pause_frame=delete_pause_frame, # 过滤停顿帧
         data_cfg=data_cfg,
     )
 
@@ -102,13 +104,12 @@ if __name__ == "__main__":
     import debugpy
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_yaml", type=str, default="./starVLA/config/training/starvla_cotrain_behavior.yaml", help="Path to YAML config")
+    parser.add_argument("--config_yaml", type=str, default="./examples/LIBERO/train_files/starvla_libero_padt_vla_only.yaml", help="Path to YAML config")
     args, clipargs = parser.parse_known_args()
 
     debugpy.listen(("0.0.0.0", 10092))
     print("🔍 Rank 0 waiting for debugger attach on port 10092...")
     debugpy.wait_for_client()
-    args.config_yaml = "./examples/MultiRobot/train_files/starvla_cotrain_multiRobot.yaml"
     cfg = OmegaConf.load(args.config_yaml)
     # cfg.datasets.vla_data.data_mix = "robotwin"
     vla_dataset_cfg = cfg.datasets.vla_data
@@ -136,7 +137,7 @@ if __name__ == "__main__":
     for batch in tqdm(train_dataloader, desc="Processing Batches"):
         # print(batch)
         # print(1)
-        if count > 100:
+        if count > 3:
             break
         count += 1
         pass

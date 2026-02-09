@@ -227,13 +227,6 @@ class _PaDT_VL_Interface(nn.Module):
         for imgs, instruction in zip(images, instructions):
             content = [{"type": "image", "image": img} for img in imgs]
 
-            # 不需要显式COT，通过padt实现一步COT
-            # # Apply CoT prompt if configured (independent of VRT)
-            # if "CoT_prompt" in self.config.datasets.vla_data:
-            #     CoT_prompt = self.config.datasets.vla_data.get("CoT_prompt", "")
-            #     prompt = CoT_prompt.replace("{instruction}", instruction)
-            # else:
-            #     prompt = instruction
             prompt = instruction
 
             content.append({"type": "text", "text": prompt})

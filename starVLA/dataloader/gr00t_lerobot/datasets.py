@@ -768,13 +768,8 @@ class LeRobotSingleDataset(Dataset):
         
         df = pd.DataFrame(answers)
         
-        # 如果有 task_index，使用它作为索引；否则用行号
-        if "task_index" in df.columns:
-            return df.set_index("task_index")
-        else:
-            # 为每一行添加索引（对应 tasks.jsonl 的顺序）
-            df.index.name = "task_index"
-            return df
+        # 使用 task_index 作为索引
+        return df.set_index("task_index")
     
     def _check_integrity(self):
         """Use the config to check if the keys are valid and detect silent data corruption."""
@@ -827,7 +822,7 @@ class LeRobotSingleDataset(Dataset):
             index (int): The index of the step to get.
 
         Returns:
-            dict: The data for the step.
+            dict: The data for the step, including action, images, language, segmentation (if available), and answers (if available).
         """
         trajectory_id, base_index = self.all_steps[index]
         data = self.get_step_data(trajectory_id, base_index)
@@ -850,7 +845,31 @@ class LeRobotSingleDataset(Dataset):
             action.append(data[action_key])
         action = np.concatenate(action, axis=1)
         
-        return dict(action=action, image=images, language=language)
+        # Prepare return dict
+        result = dict(action=action, image=images, language=language)
+        
+        # Add segmentation data if available
+        if "segmentation" in self.modality_keys and len(self.modality_keys["segmentation"]) > 0:
+            seg_key = self.modality_keys["segmentation"][0]
+            seg_data = data[seg_key]
+            result["seg"] = seg_data
+        
+        # Add answers data if available
+        if not self.answers.empty and self.curr_traj_data is not None:
+            # Get task_index from current trajectory data
+            language_key = self.modality_keys["language"][0].replace("annotation.", "")
+            annotation_meta = self.lerobot_modality_meta.annotation
+            if annotation_meta and language_key in annotation_meta:
+                original_key = annotation_meta[language_key].original_key or self.modality_keys["language"][0]
+                if original_key in self.curr_traj_data.columns:
+                    task_index_value = self.curr_traj_data[original_key].iloc[base_index]
+                    task_index = int(task_index_value) if isinstance(task_index_value, (int, float)) else int(task_index_value.item())
+                    
+                    # Get answer data for this task_index
+                    if task_index in self.answers.index:
+                        result["answers"] = self.answers.loc[task_index].to_dict()
+        
+        return result
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
         """Get the RAW data for a single step in a trajectory. No transforms are applied.
@@ -889,20 +908,30 @@ class LeRobotSingleDataset(Dataset):
         return data
 
     def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
-        """Get the data for a trajectory."""
         if self._lerobot_version == "v2.0":
-        
+            # cache hit
             if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
                 return self.curr_traj_data
-            else:
-                chunk_index = self.get_episode_chunk(trajectory_id)
-                parquet_path = self.dataset_path / self.data_path_pattern.format(
-                    episode_chunk=chunk_index, episode_index=trajectory_id
-                )
-                assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-                return pd.read_parquet(parquet_path)
+
+            chunk_index = self.get_episode_chunk(trajectory_id)
+            parquet_path = self.dataset_path / self.data_path_pattern.format(
+                episode_chunk=chunk_index, episode_index=trajectory_id
+            )
+            assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
+
+            df = pd.read_parquet(parquet_path)
+
+            # ✅ write back cache
+            self.curr_traj_id = trajectory_id
+            self.curr_traj_data = df
+            return df
+
         elif self._lerobot_version == "v3.0":
             return self.get_trajectory_data_lerobot_v3(trajectory_id)
+
+        else:
+            raise ValueError(f"Unknown lerobot version: {self._lerobot_version}")
+
     
     def get_trajectory_data_lerobot_v3(self, trajectory_id: int) -> pd.DataFrame:
         """Get the data for a trajectory from lerobot v3."""
@@ -1186,20 +1215,21 @@ class LeRobotSingleDataset(Dataset):
     ) -> list[dict]:
         """获取 segmentation 数据（已解析的 JSON 字典）"""
         import json
-        
-        traj_data = self.get_trajectory_data(trajectory_id)
+
+        # 使用已加载的轨迹数据，避免重复读取 parquet 文件
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
         delta_indices = self.delta_indices[key]
         step_indices = base_index + delta_indices
-        
+
         seg_data_list = []
         for idx in step_indices:
-            if 0 <= idx < len(traj_data):
-                json_str = traj_data.iloc[idx][key]
+            if 0 <= idx < len(self.curr_traj_data):
+                json_str = self.curr_traj_data.iloc[idx][key]
                 seg_dict = json.loads(json_str) if isinstance(json_str, str) else json_str
                 seg_data_list.append(seg_dict)
             else:
                 seg_data_list.append({})  # padding
-        
+
         return seg_data_list
 
     def get_data_by_modality(
@@ -1732,7 +1762,8 @@ class LeRobotMixtureDataset(Dataset):
             index (int): The index of the trajectory to get.
 
         Returns:
-            dict: The data for the trajectory and start index.
+            dict: The data for the trajectory and start index, including action, images, language, 
+                  segmentation (if available), answers (if available), and state (if configured).
         """
         max_retries = 10
         last_exception = None
@@ -1771,24 +1802,42 @@ class LeRobotMixtureDataset(Dataset):
                 for action_key in dataset.modality_keys["action"]:
                     action.append(data[action_key])
                 action = np.concatenate(action, axis=1).astype(np.float16)
-
-                state = []
-                for state_key in dataset.modality_keys["state"]:
-                    state.append(data[state_key])
-                state = np.concatenate(state, axis=1).astype(np.float16)
                 
-                state = None
+                # Prepare return dict
+                result = dict(action=action, image=all_images, language=language)
                 
+                # Add segmentation data if configured
+                if self.data_cfg is not None and self.data_cfg.get("include_segmentation", False) not in ["False", False]:
+                    if "segmentation" in dataset.modality_keys and len(dataset.modality_keys["segmentation"]) > 0:
+                        seg_key = dataset.modality_keys["segmentation"][0]
+                        seg_data = data[seg_key]
+                        result["seg"] = seg_data
+                
+                # Add answers data if configured
+                if self.data_cfg is not None and self.data_cfg.get("include_answers", False) not in ["False", False]:
+                    if not dataset.answers.empty and dataset.curr_traj_data is not None:
+                        # Get task_index from current trajectory data
+                        language_key = dataset.modality_keys["language"][0].replace("annotation.", "")
+                        annotation_meta = dataset.lerobot_modality_meta.annotation
+                        if annotation_meta and language_key in annotation_meta:
+                            original_key = annotation_meta[language_key].original_key or dataset.modality_keys["language"][0]
+                            if original_key in dataset.curr_traj_data.columns:
+                                task_index_value = dataset.curr_traj_data[original_key].iloc[step]
+                                task_index = int(task_index_value) if isinstance(task_index_value, (int, float)) else int(task_index_value.item())
+                                
+                                # Get answer data for this task_index
+                                if task_index in dataset.answers.index:
+                                    result["answers"] = dataset.answers.loc[task_index].to_dict()
+                
+                # Add state data if configured
                 if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
-                    
                     state = []
                     for state_key in dataset.modality_keys["state"]:
                         state.append(data[state_key])
                     state = np.concatenate(state, axis=1).astype(np.float16)
-                    # prim_images
-                    return dict(action=action, image=all_images, lang=language, state=state)
+                    result["state"] = state
 
-                return dict(action=action, image=all_images, lang=language)
+                return result
                 
             except Exception as e:
                 last_exception = e

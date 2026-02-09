@@ -426,17 +426,33 @@ class VLATrainer(TrainerUtils):
 
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
+        log_dict = {}
         with self.accelerator.accumulate(self.model):
             self.optimizer.zero_grad()
 
-            # VLA task forward propagation
+            # 检查是否需要计算 VLM loss
+            compute_vlm_loss = getattr(self.config.trainer, "compute_vlm_loss", False)
+            
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
+                # 根据配置决定是否计算 VLM loss
+                output_dict = self.model.forward(batch_vla, compute_vlm_loss=compute_vlm_loss)
 
                 action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                log_dict["action_dit_loss"] = action_loss.item()
+                
+                # 如果计算了 VLM loss，进行加权组合
+                if compute_vlm_loss and "vlm_loss" in output_dict and output_dict["vlm_loss"] is not None:
+                    vlm_loss = output_dict["vlm_loss"]
+                    vlm_loss_scale = self.config.trainer.loss_scale.vlm
+                    total_loss = action_loss + vlm_loss * vlm_loss_scale
+                    log_dict["vlm_loss"] = vlm_loss.item()
+                    log_dict["vlm_loss_weighted"] = (vlm_loss * vlm_loss_scale).item()
+                    log_dict["total_loss"] = total_loss.item()
+                else:
+                    total_loss = action_loss
+                    log_dict["total_loss"] = action_loss.item()
 
-            # VLA backward propagation
+            # 统一 backward
             self.accelerator.backward(total_loss)
 
             # gradient clipping
@@ -447,9 +463,7 @@ class VLATrainer(TrainerUtils):
             self.optimizer.step()
             self.lr_scheduler.step()
 
-        return {
-            "action_dit_loss": action_loss.item(),
-        }
+        return log_dict
 
     def _finalize_training(self):
         """training end processing"""
