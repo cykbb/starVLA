@@ -65,8 +65,19 @@ class Qwen_PI(baseframework):
         self.config = config
         self.qwen_vl_interface = get_vlm_model(config=self.config)
 
-        # dynamic get llm config
-        num_vl_layers, llm_hidden_size = 36, self.qwen_vl_interface.model.config.hidden_size
+        # dynamic get llm config (handle Qwen2.5-VL config without top-level hidden_size)
+        num_vl_layers = 36
+        vl_config = self.qwen_vl_interface.model.config
+        llm_hidden_size = getattr(vl_config, "hidden_size", None)
+        if llm_hidden_size is None and hasattr(vl_config, "text_config"):
+            llm_hidden_size = getattr(vl_config.text_config, "hidden_size", None)
+        if llm_hidden_size is None:
+            model_core = getattr(self.qwen_vl_interface.model, "model", None)
+            embed_tokens = getattr(model_core, "embed_tokens", None)
+            if embed_tokens is not None and hasattr(embed_tokens, "weight"):
+                llm_hidden_size = embed_tokens.weight.shape[1]
+        if llm_hidden_size is None:
+            raise AttributeError("Cannot resolve llm hidden_size from Qwen2.5-VL config/model")
         self.config.framework.qwenvl.vl_hidden_dim = llm_hidden_size
         self.config.framework.qwenvl.num_vl_layers = num_vl_layers
 
@@ -94,7 +105,10 @@ class Qwen_PI(baseframework):
         """
         batch_images = [example["image"] for example in examples]
         # agent_images = [[example["image"][0]] for example in examples]  #  [B, [Primary Camera only]] - 只使用第三视角
-        instructions = [example["lang"] for example in examples]  # [B, str]
+        instructions = [example.get("lang", example.get("language")) for example in examples]  # [B, str]
+        if any(instr is None for instr in instructions):
+            missing = [i for i, instr in enumerate(instructions) if instr is None]
+            raise KeyError(f"Missing instruction key ('lang' or 'language') in examples at indices {missing}")
         # print(f"instruction: {instructions[0]}")
         actions = [example["action"] for example in examples]  # label [B， len, 7]
         

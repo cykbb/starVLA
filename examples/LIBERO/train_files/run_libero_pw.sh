@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J padtpi_libero
+#SBATCH -J padtpi_libero_pw
 #SBATCH -p h200n              # 队列/partition
 #SBATCH -A prj0000000267          # 项目号/Account
 #SBATCH -t 0-12                   # 运行时间：0-12 = 12小时
@@ -48,7 +48,7 @@ echo "Current directory: $(pwd)"
 
 Framework_name=PaDTPI
 freeze_module_list=''
-base_vlm=playground/Pretrained_models/Qwen2.5-VL-3B-Instruct
+base_vlm=playground/Pretrained_models/PaDT_Pro_3B
 config_yaml=./examples/LIBERO/train_files/starvla_libero_padt_vla_only.yaml
 libero_data_root=playground/Datasets/LEROBOT_LIBERO_DATA
 data_mix=libero_all
