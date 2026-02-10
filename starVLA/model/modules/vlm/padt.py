@@ -118,10 +118,19 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 
         if self.use_visual_prototype_projection:
             self.lora_r = 64
-            self.vis_norm = ZeroInitLayerNorm(self.config.hidden_size)
+            # Robustly resolve hidden size across config variants
+            hidden_size = getattr(self.config, "hidden_size", None)
+            if hidden_size is None and hasattr(self.config, "text_config"):
+                hidden_size = getattr(self.config.text_config, "hidden_size", None)
+            if hidden_size is None and hasattr(self, "model") and hasattr(self.model, "embed_tokens"):
+                hidden_size = self.model.embed_tokens.weight.shape[1]
+            if hidden_size is None:
+                raise AttributeError("Cannot determine hidden_size from config or model")
+
+            self.vis_norm = ZeroInitLayerNorm(hidden_size)
             self.vis_proj = nn.Sequential(
-                nn.Linear(self.config.hidden_size, self.lora_r, bias=False),
-                nn.Linear(self.lora_r, self.config.hidden_size, bias=False),
+                nn.Linear(hidden_size, self.lora_r, bias=False),
+                nn.Linear(self.lora_r, hidden_size, bias=False),
             )
             
         self.rope_deltas = None
@@ -148,9 +157,9 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         for cache offsetting."""
 
         spatial_merge_size = self.config.vision_config.spatial_merge_size
-        image_token_id = self.config.image_token_id
-        video_token_id = self.config.video_token_id
-        vision_start_token_id = self.config.vision_start_token_id
+        image_token_id = getattr(self.config, "image_token_id", None) or getattr(getattr(self.config, "text_config", None), "image_token_id", None)
+        video_token_id = getattr(self.config, "video_token_id", None) or getattr(getattr(self.config, "text_config", None), "video_token_id", None)
+        vision_start_token_id = getattr(self.config, "vision_start_token_id", None) or getattr(getattr(self.config, "text_config", None), "vision_start_token_id", None)
         mrope_position_deltas: List[torch.Tensor] = []
 
         if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
@@ -304,15 +313,46 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 # diff
+        # ── 兼容 Qwen2.5-VL 嵌套 config：统一获取 vocab_size / image_token_id / video_token_id ──
+        def _cfg(name, default=None):
+            v = getattr(self.config, name, None)
+            if v is None and hasattr(self.config, "text_config"):
+                v = getattr(self.config.text_config, name, None)
+            return v if v is not None else default
 
-        vocab_size = self.config.vocab_size
+        vocab_size = _cfg("vocab_size")
+        if vocab_size is None:
+            vocab_size = self.get_input_embeddings().weight.shape[0]
+        image_token_id = _cfg("image_token_id")
+        video_token_id = _cfg("video_token_id")
+
+        # ── 获取 visual encoder（Qwen2.5-VL 里在 self.model.visual）──
+        visual_encoder = getattr(self, "visual", None)
+        if visual_encoder is None and hasattr(self, "model") and hasattr(self.model, "visual"):
+            visual_encoder = self.model.visual
 
         if inputs_embeds is None:
             if pixel_values is not None:
-                pixel_values = pixel_values.type(self.visual.dtype)
+                if visual_encoder is None:
+                    raise AttributeError("PaDTForConditionalGeneration: cannot find visual encoder (self.visual / self.model.visual)")
+
+                visual_dtype = getattr(visual_encoder, "dtype", None)
+                if visual_dtype is None:
+                    visual_dtype = next(visual_encoder.parameters()).dtype
+
+                pixel_values = pixel_values.type(visual_dtype)
                 # 提取特征
-                #image_embeds, high_res_image_embeds, visual_pe = self.visual(pixel_values, grid_thw=image_grid_thw)
-                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                # Qwen2.5-VL visual 返回 BaseModelOutputWithPooling:
+                #   last_hidden_state = merger 前 (vision_hidden_size=1280)
+                #   pooler_output     = merger 后 (llm_hidden_size=2048)
+                # 我们需要 pooler_output（已投射到 LLM 空间）
+                vis_out = visual_encoder(pixel_values, grid_thw=image_grid_thw)
+                if isinstance(vis_out, torch.Tensor):
+                    image_embeds = vis_out
+                elif hasattr(vis_out, "pooler_output") and vis_out.pooler_output is not None:
+                    image_embeds = vis_out.pooler_output
+                else:
+                    image_embeds = vis_out.last_hidden_state
 
                 # 视觉特征投影到视觉原型
                 if self.use_visual_prototype_projection:
@@ -331,7 +371,7 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 logit_mask[:, :vocab_size] = True
 
                 # 按输入序列中图片 token 的顺序，为每个样本分配对应的图片原型区间
-                image_token_counts = (input_ids == self.config.image_token_id).sum(dim=1)
+                image_token_counts = (input_ids == image_token_id).sum(dim=1)
                 cursor = 0
                 for b, count in enumerate(image_token_counts.tolist()):
                     if count > 0:
@@ -348,7 +388,7 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 inputs_embeds = extended_embed_tokens[input_ids]
 
                 # 确保图片token和图片特征数量匹配
-                n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
+                n_image_tokens = (input_ids == image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
                 if n_image_tokens != n_image_features:
                     raise ValueError(
@@ -356,7 +396,7 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                     )
                 # 用图片特征替换图片token的embedding
                 image_mask = (
-                    (input_ids == self.config.image_token_id)
+                    (input_ids == image_token_id)
                     .unsqueeze(-1)
                     .expand_as(inputs_embeds)
                     .to(inputs_embeds.device)
@@ -380,16 +420,25 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 logit_mask = inputs_embeds.new_ones((input_ids.shape[0], vocab_size), dtype=torch.bool)
 # 
             if pixel_values_videos is not None:
-                pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
-                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-                n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
+                if visual_encoder is None:
+                    raise AttributeError("PaDTForConditionalGeneration: cannot find visual encoder for video")
+                v_dtype = getattr(visual_encoder, "dtype", None) or next(visual_encoder.parameters()).dtype
+                pixel_values_videos = pixel_values_videos.type(v_dtype)
+                vid_out = visual_encoder(pixel_values_videos, grid_thw=video_grid_thw)
+                if isinstance(vid_out, torch.Tensor):
+                    video_embeds = vid_out
+                elif hasattr(vid_out, "pooler_output") and vid_out.pooler_output is not None:
+                    video_embeds = vid_out.pooler_output
+                else:
+                    video_embeds = vid_out.last_hidden_state
+                n_video_tokens = (input_ids == video_token_id).sum().item()
                 n_video_features = video_embeds.shape[0]
                 if n_video_tokens != n_video_features:
                     raise ValueError(
                         f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
                     )
                 video_mask = (
-                    (input_ids == self.config.video_token_id)
+                    (input_ids == video_token_id)
                     .unsqueeze(-1)
                     .expand_as(inputs_embeds)
                     .to(inputs_embeds.device)
@@ -463,7 +512,7 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_logits = shift_logits.view(-1, shift_logits.shape[-1])
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)

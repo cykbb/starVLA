@@ -764,7 +764,18 @@ class LeRobotSingleDataset(Dataset):
             return pd.DataFrame()
         
         with open(answers_path, "r") as f:
-            answers = [json.loads(line) for line in f]
+            answers = []
+            for idx, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue  # skip blank lines
+                try:
+                    answers.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(
+                        f"Warning: skip malformed JSON in answers.jsonl line {idx} at {answers_path}: {e}"
+                    )
+                    continue
         
         df = pd.DataFrame(answers)
         

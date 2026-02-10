@@ -12,14 +12,14 @@ from typing import Dict, Optional, List
 from torch.nn.utils.rnn import pad_sequence
 from transformers import BatchFeature
 
-from starVLA.model.modules.PaDT.models import VisonTextProcessingClass
-
 from qwen_vl_utils import process_vision_info
 
 try:
     from .padt import PaDTForConditionalGeneration
+    from .padt_tools import VisonTextProcessingClass
 except ImportError:
     from padt import PaDTForConditionalGeneration
+    from padt_tools import VisonTextProcessingClass
     
 from accelerate.logging import get_logger
 

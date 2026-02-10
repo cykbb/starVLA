@@ -68,8 +68,20 @@ class PaDT_PI(baseframework):
         model_cls = PaDTForConditionalGeneration
         
 
-        # dynamic get llm config
-        num_vl_layers, llm_hidden_size = 36, self.padt_vl_interface.model.config.hidden_size
+        # dynamic get llm config (Qwen2.5 VL configs sometimes omit top-level hidden_size)
+        vl_config = self.padt_vl_interface.model.config
+        llm_hidden_size = getattr(vl_config, "hidden_size", None)
+        if llm_hidden_size is None and hasattr(vl_config, "text_config"):
+            llm_hidden_size = getattr(vl_config.text_config, "hidden_size", None)
+        if llm_hidden_size is None:
+            model_core = getattr(self.padt_vl_interface.model, "model", None)
+            embed_tokens = getattr(model_core, "embed_tokens", None)
+            if embed_tokens is not None and hasattr(embed_tokens, "weight"):
+                llm_hidden_size = embed_tokens.weight.shape[1]
+        if llm_hidden_size is None:
+            raise AttributeError("Cannot resolve llm hidden_size from Qwen2_5_VL config/model")
+
+        num_vl_layers = 36
         self.config.framework.qwenvl.vl_hidden_dim = llm_hidden_size
         self.config.framework.qwenvl.num_vl_layers = num_vl_layers
 
@@ -112,14 +124,33 @@ class PaDT_PI(baseframework):
         completions = []
         solutions = []
         
-        for example in examples:
+        # 为 VLM loss 降低图片分辨率以节省显存（减少 visual token 数量）
+        vlm_image_size = 168
+        images_per_sample = []
+        vlm_batch_images = []
+        for imgs in batch_images:
+            if isinstance(imgs, (list, tuple)):
+                resized_imgs = [img.resize((vlm_image_size, vlm_image_size)) if hasattr(img, 'resize') else img for img in imgs]
+                vlm_batch_images.append(resized_imgs)
+                images_per_sample.append(len(imgs))
+            else:
+                vlm_batch_images.append([imgs.resize((vlm_image_size, vlm_image_size)) if hasattr(imgs, 'resize') else imgs])
+                images_per_sample.append(1)
+        
+        for i_ex, example in enumerate(examples):
             answers_data = example["answers"]
             
             # 从 answers 中提取对话
             if "conversations" in answers_data and len(answers_data["conversations"]) > 0:
-                # 使用对话作为 prompt
+                # 使用对话作为 prompt，同时加入图片占位（与 build_padtvl_inputs 对齐）
                 conversation = answers_data["conversations"][0]
-                prompt = [{"role": "user", "content": conversation["value"]}]
+                imgs = vlm_batch_images[i_ex]  # 已 resize 的低分辨率图
+                if isinstance(imgs, (list, tuple)):
+                    content = [{"type": "image", "image": img} for img in imgs]
+                else:
+                    content = [{"type": "image", "image": imgs}]
+                content.append({"type": "text", "text": conversation["value"]})
+                prompt = [{"role": "user", "content": content}]
                 prompts.append(prompt)
                 
                 # 使用 answer_template 作为 completion（后续用 VRT 替换 <|Obj_x|>）
@@ -221,17 +252,11 @@ class PaDT_PI(baseframework):
             prompt, tokenize=False, add_generation_prompt=True
         ) for prompt in prompts]
         
-        # 使用所有视角的图片（和padt.py的forward逻辑一致）
-        # batch_images: List[List[PIL.Image]], 展平为一维列表供processor处理
+        # 使用所有视角的图片（和 build_padtvl_inputs 一致，保留多视角信息）
         from qwen_vl_utils import process_vision_info
         
-        # 构建messages用于process_vision_info
-        messages_for_vision = []
-        for imgs in batch_images:
-            content = [{"type": "image", "image": img} for img in imgs]
-            messages_for_vision.append([{"role": "user", "content": content}])
-        
-        image_inputs, _ = process_vision_info(messages_for_vision)
+        # prompts 已经包含 resize 后的图片信息，直接用于 process_vision_info
+        image_inputs, _ = process_vision_info(prompts)
         
         # Tokenize prompts with images
         prompt_inputs = self.padt_vl_interface.processor(
@@ -265,7 +290,7 @@ class PaDT_PI(baseframework):
 
         # 重新映射 VRT token 到全局 ID（与 PaDT 训练对齐）
         if prompt_inputs.get('image_grid_thw') is not None:
-            input_ids = processor.assign_to_global_vrt_id(input_ids, prompt_inputs['image_grid_thw'])
+            input_ids = processor.assign_to_global_vrt_id(input_ids, prompt_inputs['image_grid_thw'], images_per_sample=images_per_sample)
         
         # Prepare multimodal inputs
         multimodal_inputs = {
@@ -273,16 +298,16 @@ class PaDT_PI(baseframework):
             'pixel_values': prompt_inputs.get('pixel_values')
         }
         
-        # Forward pass
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        # Forward pass（用 no_grad 避免存储中间激活值，大幅节省显存）
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             model_output = self.padt_vl_interface.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 **multimodal_inputs
             )
+            logits = model_output.logits[:, prompt_length-1:-1, :].detach()  # (B, L, V)
         
-        # Compute token loss
-        logits = model_output.logits[:, prompt_length-1:-1, :]  # (B, L, V)
+        # Compute token loss（在 no_grad 外计算，但 logits 已 detach，不回传 VLM 梯度）
         target_ids = input_ids[:, prompt_length:]  # (B, L)
         
         # Calculate cross-entropy loss
@@ -369,6 +394,13 @@ class PaDT_PI(baseframework):
         
         # 计算 VLM loss（如果需要且数据可用）
         if compute_vlm_loss:
+            # 释放 action path 的中间变量，腾出 GPU 显存给 VLM loss forward
+            del padt_inputs, padt_outputs, all_hidden, vl_embs_list, base_hidden
+            del vl_embs_list_repeated, actions_target_repeated, actions_target
+            if state_repeated is not None:
+                del state_repeated
+            torch.cuda.empty_cache()
+            
             vlm_loss = self.compute_vlm_loss(examples, batch_images, instructions)
             if vlm_loss is not None:
                 output_dict["vlm_loss"] = vlm_loss
