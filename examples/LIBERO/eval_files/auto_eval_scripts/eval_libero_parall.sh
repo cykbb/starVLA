@@ -1,8 +1,8 @@
 ###########################################################################################
-# === Please modify the following paths according to your environment ===
-export LIBERO_HOME=/mnt/petrelfs/share/yejinhui/Projects/LIBERO  # Root directory of the LIBERO project
-export LIBERO_python=/mnt/petrelfs/share/yejinhui/Envs/miniconda3/envs/lerobot/bin/python  # Path to the Python environment
-export starVLA_python=/mnt/petrelfs/share/yejinhui/Envs/miniconda3/envs/starVLA/bin/python  # Path to the Python environment
+# === Paths for current cluster environment ===
+export LIBERO_HOME=/home/users/astar/i2r/lishijie/yk/LIBERO  # LIBERO project root
+export LIBERO_python=/scratch/prj0000000267/grasping_challenge/.conda/envs/starVLA/bin/python
+export starVLA_python=/scratch/prj0000000267/grasping_challenge/.conda/envs/starVLA/bin/python
 
 # === End of environment variable configuration ===
 export LIBERO_CONFIG_PATH=${LIBERO_HOME}/libero  # Path to LIBERO configuration files
@@ -13,7 +13,7 @@ export PYTHONPATH=$(pwd):${PYTHONPATH} # let LIBERO find the websocket tools fro
 
 
 ##### === variables for which evaluation to setup ===
-your_ckpt=$1 # results/Checkpoints/1025_libero_all_qwengroot/checkpoints/steps_20000_pytorch_model.pt
+your_ckpt=$1 # /home/users/astar/i2r/lishijie/grasping_challenge/scratch/results/Checkpoints/padtpi_libero_vla_only/checkpoints/steps_5000_pytorch_model.pt
 task_suite_name=$2 # align with your model | libero_goal
 run_index=$3
 # your_ckpt=results/Checkpoints/1025_libero_10_qwengroot/checkpoints/steps_10000_pytorch_model.pt
@@ -50,7 +50,7 @@ mkdir -p "$log_path"
 
 
 
-${LIBERO_python} ./examples/LIBERO/eval_files/eval_libero.py \
+SAVE_VIDEO=${SAVE_VIDEO:-true} ${LIBERO_python} ./examples/LIBERO/eval_files/eval_libero.py \
     --args.pretrained-path ${your_ckpt} \
     --args.host "$host" \
     --args.port $base_port \

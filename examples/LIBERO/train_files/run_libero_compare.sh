@@ -2,7 +2,7 @@
 #SBATCH -J qwenpi_libero_cmp
 #SBATCH -p h200n
 #SBATCH -A prj0000000267
-#SBATCH -t 0-12
+#SBATCH -t 0-18
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
@@ -37,7 +37,7 @@ cd /home/users/astar/i2r/lishijie/yk/starVLA || exit 1
 echo "Current directory: $(pwd)"
 
 Framework_name=QwenPI
-freeze_module_list=''
+freeze_module_list='visual'
 base_vlm=playground/Pretrained_models/Qwen2.5-VL-3B-Instruct
 config_yaml=./examples/LIBERO/train_files/starvla_libero_vla_only.yaml
 libero_data_root=playground/Datasets/LEROBOT_LIBERO_DATA
@@ -67,8 +67,8 @@ accelerate launch \
   --trainer.freeze_modules ${freeze_module_list} \
   --trainer.max_train_steps 30000 \
   --trainer.save_interval 5000 \
-  --trainer.logging_frequency 100 \
-  --trainer.eval_interval 1000 \
+  --trainer.logging_frequency 1000 \
+  --trainer.eval_interval 5000 \
   --run_root_dir ${run_root_dir} \
   --run_id ${run_id} \
   --wandb_entity bykkk-nanyang-technological-university-singapore \

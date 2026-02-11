@@ -8,6 +8,7 @@ import pathlib
 from pathlib import Path
 import requests
 import time
+import logging
 
 import imageio
 import numpy as np
@@ -18,6 +19,14 @@ from libero.libero.envs import OffScreenRenderEnv
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from examples.LIBERO.eval_files.model2libero_interface import ModelClient
 
+# toggle video saving via env SAVE_VIDEO (default: true)
+SAVE_VIDEO = os.environ.get("SAVE_VIDEO", "true").lower() in ["1", "true", "yes", "y"]
+
+# Make sure INFO logs are visible when run from bash/slurm
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -91,6 +100,9 @@ def eval_libero(args: Args) -> None:
         image_size=args.resize_size,
     )
 
+    logging.info(f"Tasks in suite: {num_tasks_in_suite}, trials per task: {args.num_trials_per_task}, max_steps: {max_steps}")
+    logging.info(f"Video saving: {SAVE_VIDEO}, output dir: {args.video_out_path}")
+
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
@@ -107,7 +119,7 @@ def eval_libero(args: Args) -> None:
         # Start episodes
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
-            logging.info(f"\nTask: {task_description}")
+            logging.info(f"[Task {task_id+1}/{num_tasks_in_suite}] {task_description} | Episode {episode_idx+1}/{args.num_trials_per_task}")
 
             # Reset environment
             client_model.reset(task_description=task_description)  # Reset the client connection
@@ -214,12 +226,13 @@ def eval_libero(args: Args) -> None:
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path)
-                / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
-            )
+            if SAVE_VIDEO:
+                imageio.mimwrite(
+                    pathlib.Path(args.video_out_path)
+                    / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.mp4",
+                    [np.asarray(x) for x in replay_images],
+                    fps=10,
+                )
             
             full_actions = np.stack(full_actions)
             # np.save(pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.npy", full_actions)

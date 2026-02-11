@@ -2,7 +2,7 @@
 #SBATCH -J padtpi_libero_pw
 #SBATCH -p h200n              # 队列/partition
 #SBATCH -A prj0000000267          # 项目号/Account
-#SBATCH -t 0-12                   # 运行时间：0-12 = 12小时
+#SBATCH -t 0-24                   # 运行时间：0-24 = 24小时
 #SBATCH -N 1                      # 1 个节点
 #SBATCH --ntasks-per-node=8       # 每节点 8 个任务
 #SBATCH --gres=gpu:8              # 申请 8 张 GPU
@@ -47,13 +47,13 @@ cd /home/users/astar/i2r/lishijie/yk/starVLA || exit 1
 echo "Current directory: $(pwd)"
 
 Framework_name=PaDTPI
-freeze_module_list=''
+freeze_module_list='padt_vl_interface.model.model.visual'
 base_vlm=playground/Pretrained_models/PaDT_Pro_3B
 config_yaml=./examples/LIBERO/train_files/starvla_libero_padt_vla_only.yaml
 libero_data_root=playground/Datasets/LEROBOT_LIBERO_DATA
 data_mix=libero_all
 run_root_dir=/home/users/astar/i2r/lishijie/grasping_challenge/scratch/results/Checkpoints
-run_id=padtpi_libero_vla_only
+run_id=padtpi_libero_vla_pw_only
 
 
 
@@ -62,6 +62,7 @@ mkdir -p "${output_dir}"
 ln -sfn "${run_root_dir}" "$(pwd)/results/Checkpoints"
 cp "$0" "${output_dir}/" || true
 
+export WANDB_MODE=offline
 ############################
 # 启动训练
 ############################

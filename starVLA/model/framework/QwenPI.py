@@ -180,9 +180,12 @@ class Qwen_PI(baseframework):
                 normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
         """
         from deployment.model_server.tools.image_tools import to_pil_preserve
-        batch_images = [to_pil_preserve(example["image"]) for example in examples]  #  [B，[PLT]]
-        instructions = [example["lang"] for example in examples]  # [B, str]
-    
+        batch_images = [to_pil_preserve(example["image"]) for example in examples]  #  [B，[PIL]]
+        instructions = [example.get("lang", example.get("language")) for example in examples]  # [B, str]
+        if any(instr is None for instr in instructions):
+            missing = [i for i, instr in enumerate(instructions) if instr is None]
+            raise KeyError(f"Missing instruction key ('lang' or 'language') in examples at indices {missing}")
+
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
         
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)

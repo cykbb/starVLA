@@ -40,14 +40,21 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         vla_dataset_cfg = cfg.datasets.vla_data
 
         vla_dataset = get_vla_dataset(data_cfg=vla_dataset_cfg)
-        
+
+        # DataLoader args from config (with safe defaults)
+        dl_num_workers = getattr(vla_dataset_cfg, "dataloader_num_workers", 4)
+        dl_prefetch = getattr(vla_dataset_cfg, "prefetch_factor", None)
+        dl_pin_memory = getattr(vla_dataset_cfg, "pin_memory", False)
+
         vla_train_dataloader = DataLoader(
             vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
-            num_workers=4,
+            num_workers=dl_num_workers,
+            prefetch_factor=dl_prefetch,
+            pin_memory=dl_pin_memory,
             # shuffle=True
-        )        
+        )
         if dist.get_rank() == 0: 
             
             output_dir = Path(cfg.output_dir)

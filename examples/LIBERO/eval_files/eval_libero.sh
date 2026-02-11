@@ -1,14 +1,13 @@
 #!/bin/bash
 #SBATCH -J padtpi_libero
-#SBATCH -p testqueue              # 队列/partition
+#SBATCH -p h200n             # 队列/partition
 #SBATCH -A prj0000000267          # 项目号/Account
 #SBATCH -t 0-20                   # 运行时间：0-20 = 20小时
 #SBATCH -N 1                      # 1 个节点
-#SBATCH --ntasks-per-node=2       # 每节点 2 个任务
-#SBATCH --gres=gpu:2              # 申请 2 张 GPU
+#SBATCH --ntasks-per-node=8       # 每节点 2 个任务
+#SBATCH --gres=gpu:8              # 申请 2 张 GPU
 #SBATCH -o slurm_%x_%j.out        # 标准输出
 #SBATCH -e slurm_%x_%j.err        # 错误输出
-
 set -euo pipefail
 
 ############################
@@ -52,7 +51,7 @@ fi
 host="127.0.0.1"
 base_port=5694
 unnorm_key="franka"
-your_ckpt="/home/users/astar/i2r/lishijie/yk/starVLA/results/Checkpoints/qwenpi_libero_vla_only/checkpoints/steps_15000_pytorch_model.pt"
+your_ckpt="/home/users/astar/i2r/lishijie/grasping_challenge/scratch/results/Checkpoints/padtpi_libero_vla_only/checkpoints/steps_5000_pytorch_model.pt"
 export DEBUG=true
 
 folder_name="$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')"
@@ -65,6 +64,8 @@ mkdir -p "${LOG_DIR}"
 task_suite_name="libero_goal"
 num_trials_per_task=5  # 减少到5次试验进行快速测试
 video_out_path="results/${task_suite_name}/${folder_name}"
+
+export SAVE_VIDEO=True
 
 "${LIBERO_Python}" ./examples/LIBERO/eval_files/eval_libero.py \
   --args.pretrained-path "${your_ckpt}" \

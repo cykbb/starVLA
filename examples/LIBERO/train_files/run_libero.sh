@@ -2,7 +2,7 @@
 #SBATCH -J padtpi_libero
 #SBATCH -p h200n              # 队列/partition
 #SBATCH -A prj0000000267          # 项目号/Account
-#SBATCH -t 0-12                   # 运行时间：0-12 = 12小时
+#SBATCH -t 0-24                   # 运行时间：0-24 = 24小时
 #SBATCH -N 1                      # 1 个节点
 #SBATCH --ntasks-per-node=8       # 每节点 8 个任务
 #SBATCH --gres=gpu:8              # 申请 8 张 GPU
@@ -47,7 +47,8 @@ cd /home/users/astar/i2r/lishijie/yk/starVLA || exit 1
 echo "Current directory: $(pwd)"
 
 Framework_name=PaDTPI
-freeze_module_list=''
+# Freeze the PaDT VLM vision encoder (exact module path for TrainerUtils.freeze_backbones)
+freeze_module_list='padt_vl_interface.model.model.visual'
 base_vlm=playground/Pretrained_models/Qwen2.5-VL-3B-Instruct
 config_yaml=./examples/LIBERO/train_files/starvla_libero_padt_vla_only.yaml
 libero_data_root=playground/Datasets/LEROBOT_LIBERO_DATA
@@ -62,6 +63,7 @@ mkdir -p "${output_dir}"
 ln -sfn "${run_root_dir}" "$(pwd)/results/Checkpoints"
 cp "$0" "${output_dir}/" || true
 
+export WANDB_MODE=offline
 ############################
 # 启动训练
 ############################
@@ -84,4 +86,5 @@ accelerate launch \
   --run_root_dir ${run_root_dir} \
   --run_id ${run_id} \
   --wandb_entity bykkk-nanyang-technological-university-singapore \
-  --wandb_project starVLA_Libero
+  --wandb_project starVLA_Libero \
+  --trainer.pretrained_checkpoint /home/users/astar/i2r/lishijie/grasping_challenge/scratch/results/Checkpoints/padtpi_libero_vla_only/checkpoints/steps_5000_pytorch_model.pt

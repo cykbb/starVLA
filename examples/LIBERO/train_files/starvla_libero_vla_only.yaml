@@ -79,7 +79,7 @@ trainer:
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
-  freeze_modules: ''
+  freeze_modules: 'visual'
   # 移除 vlm 相关的 loss_scale
   max_grad_norm: 1.0
   warmup_ratio: 0.1
