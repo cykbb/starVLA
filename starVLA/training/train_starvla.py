@@ -153,6 +153,9 @@ class VLATrainer(TrainerUtils):
         # load pretrained weights
         self._init_checkpointing() # TODO merge with load pretrained weights
 
+        # enable gradient checkpointing to save memory when VLM grads flow
+        self._maybe_enable_gradient_checkpointing()
+
         # 根据  resume 调整 lr_scheduler
         self._adjust_lr_scheduler_for_resume()
 
@@ -176,6 +179,36 @@ class VLATrainer(TrainerUtils):
         )
 
         self._init_wandb()
+
+
+    def _maybe_enable_gradient_checkpointing(self):
+        flag = getattr(self.config.trainer, "enable_gradient_checkpointing", False)
+        if not flag:
+            return
+
+        vlm_wrapper = getattr(self.model, "padt_vl_interface", None)
+        if vlm_wrapper is None:
+            logger.warning("Gradient checkpointing skipped: no padt_vl_interface found")
+            return
+
+        vlm_core = getattr(vlm_wrapper, "model", None)
+        if vlm_core is None:
+            logger.warning("Gradient checkpointing skipped: padt_vl_interface has no model attribute")
+            return
+
+        try:
+            if hasattr(vlm_core, "config"):
+                setattr(vlm_core.config, "use_cache", False)
+            if hasattr(vlm_core, "gradient_checkpointing_enable"):
+                vlm_core.gradient_checkpointing_enable()
+
+            visual = getattr(getattr(vlm_core, "model", None), "visual", None)
+            if visual is not None and hasattr(visual, "gradient_checkpointing_enable"):
+                visual.gradient_checkpointing_enable()
+
+            logger.info("Gradient checkpointing enabled for PaDT VLM")
+        except Exception as e:
+            logger.warning(f"Failed to enable gradient checkpointing: {e}")
 
 
     def _adjust_lr_scheduler_for_resume(self):

@@ -110,11 +110,25 @@ def eval_libero(args: Args) -> None:
         # Get task
         task = task_suite.get_task(task_id)
 
-        # Get default LIBERO initial states
-        initial_states = task_suite.get_task_init_states(task_id)
+        # Get default LIBERO initial states; fall back to env defaults when missing
+        try:
+            initial_states = task_suite.get_task_init_states(task_id)
+        except FileNotFoundError as e:
+            logging.warning(
+                "Init states missing for task %s (path=%s); falling back to env.reset() only.",
+                task_id,
+                getattr(e, "filename", "unknown"),
+            )
+            initial_states = None
 
-        # Initialize LIBERO environment and task description
-        env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+        # Initialize LIBERO environment and task description; skip task if assets missing
+        try:
+            env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+        except (AssertionError, FileNotFoundError) as e:
+            logging.warning(
+                "Skip task %s due to missing assets: %s", task_id, str(e)
+            )
+            continue
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -123,10 +137,11 @@ def eval_libero(args: Args) -> None:
 
             # Reset environment
             client_model.reset(task_description=task_description)  # Reset the client connection
-            env.reset()
+            obs = env.reset()
 
-            # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx])
+            # Set initial states when available; otherwise keep the fresh reset state
+            if initial_states is not None:
+                obs = env.set_init_state(initial_states[episode_idx % len(initial_states)])
 
             # Setup
             t = 0
@@ -267,6 +282,8 @@ def _get_libero_env(task, resolution, seed):
         / task.problem_folder
         / task.bddl_file
     )
+    if not task_bddl_file.exists():
+        raise FileNotFoundError(f"BDDL file not found: {task_bddl_file}")
     env_args = {
         "bddl_file_name": task_bddl_file,
         "camera_heights": resolution,

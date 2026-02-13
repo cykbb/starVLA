@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH -J padtpi_libero
-#SBATCH -p h200n             # 队列/partition
+#SBATCH -p testqueue            # 队列/partition
 #SBATCH -A prj0000000267          # 项目号/Account
 #SBATCH -t 0-20                   # 运行时间：0-20 = 20小时
 #SBATCH -N 1                      # 1 个节点
-#SBATCH --ntasks-per-node=8       # 每节点 2 个任务
-#SBATCH --gres=gpu:8              # 申请 2 张 GPU
+#SBATCH --ntasks-per-node=2       # 每节点 2 个任务
+#SBATCH --gres=gpu:2              # 申请 2 张 GPU
 #SBATCH -o slurm_%x_%j.out        # 标准输出
 #SBATCH -e slurm_%x_%j.err        # 错误输出
 set -euo pipefail

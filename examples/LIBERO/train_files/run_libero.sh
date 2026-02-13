@@ -87,4 +87,4 @@ accelerate launch \
   --run_id ${run_id} \
   --wandb_entity bykkk-nanyang-technological-university-singapore \
   --wandb_project starVLA_Libero \
-  --trainer.pretrained_checkpoint /home/users/astar/i2r/lishijie/grasping_challenge/scratch/results/Checkpoints/padtpi_libero_vla_only/checkpoints/steps_5000_pytorch_model.pt
+#  --trainer.pretrained_checkpoint /home/users/astar/i2r/lishijie/grasping_challenge/scratch/results/Checkpoints/padtpi_libero_vla_only/checkpoints/steps_5000_pytorch_model.pt

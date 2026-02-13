@@ -51,11 +51,11 @@ datasets:
   vla_data:
     dataset_py: lerobot_datasets
     data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
-    data_mix: libero_all # libero_goal
+    data_mix: libero_goal # libero_goal
     action_type: delta_qpos
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     CoT_answer: bbox
-    default_image_resolution: [3, 224, 224]
+    default_image_resolution: [3, 256, 256]
     per_device_batch_size: 32
     dataloader_num_workers: 8
     prefetch_factor: 2
@@ -86,6 +86,7 @@ trainer:
   loss_scale:
     vlm: 0.5
   compute_vlm_loss: true
+  detach_action_features: false   # action loss 不回传梯度到 VLM，避免梯度冲突
   max_grad_norm: 1.0
   warmup_ratio: 0.1
   weight_decay: 0.0
@@ -103,5 +104,5 @@ trainer:
   is_resume: true
   resume_epoch: null
   resume_step: null
-  enable_gradient_checkpointing: true
+  enable_gradient_checkpointing: false
   enable_mixed_precision_training: true

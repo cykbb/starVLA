@@ -21,7 +21,7 @@ run_index=$3
 # run_index=8
 ##### === variables for which evaluation to setup ===
 
-num_gpus=8
+num_gpus=2
 gpu_id=$((run_index % num_gpus))
 
 num_trials_per_task=50

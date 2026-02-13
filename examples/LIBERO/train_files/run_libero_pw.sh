@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -J padtpi_libero_pw
-#SBATCH -p h200n              # 队列/partition
+#SBATCH -p testqueue              # 队列/partition
 #SBATCH -A prj0000000267          # 项目号/Account
-#SBATCH -t 0-24                   # 运行时间：0-24 = 24小时
+#SBATCH -t 0-15                   # 运行时间：0-24 = 24小时
 #SBATCH -N 1                      # 1 个节点
 #SBATCH --ntasks-per-node=8       # 每节点 8 个任务
 #SBATCH --gres=gpu:8              # 申请 8 张 GPU
@@ -49,11 +49,11 @@ echo "Current directory: $(pwd)"
 Framework_name=PaDTPI
 freeze_module_list='padt_vl_interface.model.model.visual'
 base_vlm=playground/Pretrained_models/PaDT_Pro_3B
-config_yaml=./examples/LIBERO/train_files/starvla_libero_padt_vla_only.yaml
+config_yaml=./examples/LIBERO/train_files/starvla_libero_padt_pw_vla_only.yaml
 libero_data_root=playground/Datasets/LEROBOT_LIBERO_DATA
-data_mix=libero_all
+data_mix=libero_goal
 run_root_dir=/home/users/astar/i2r/lishijie/grasping_challenge/scratch/results/Checkpoints
-run_id=padtpi_libero_vla_pw_only
+run_id=padtpi_libero_pw_with_grads_goal
 
 
 
@@ -75,7 +75,7 @@ accelerate launch \
   --framework.qwenvl.base_vlm ${base_vlm} \
   --datasets.vla_data.data_root_dir ${libero_data_root} \
   --datasets.vla_data.data_mix ${data_mix} \
-  --datasets.vla_data.per_device_batch_size 32 \
+  --datasets.vla_data.per_device_batch_size 18 \
   --trainer.vla_data.video_backend torchvision_av \
   --trainer.freeze_modules ${freeze_module_list} \
   --trainer.max_train_steps 30000 \

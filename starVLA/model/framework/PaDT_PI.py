@@ -143,13 +143,14 @@ class PaDT_PI(baseframework):
         if "answers" not in examples[0]:
             return None
             
-        # 构建 prompt 和 completion，并准备 solutions（用于 bbox 等信息）
+        # 构建 prompt，收集 completion_raw 与 objects_info，稍后根据 runtime grid 重映射 patches 再生成 completion
         prompts = []
-        completions = []
-        solutions = []
+        completion_raw_list = []
+        objects_infos_list = []
+        patch_ids_all: list[int] = []  # collect offline patch ids to sanity-check with processor grid
         
-        # 为 VLM loss 降低图片分辨率以节省显存（减少 visual token 数量）
-        vlm_image_size = 168
+        # 与离线预处理保持一致：长边 644（PaDT 默认缩放逻辑）
+        vlm_image_size = 644
         images_per_sample = []
         vlm_batch_images = []
         for imgs in batch_images:
@@ -216,6 +217,11 @@ class PaDT_PI(baseframework):
                                     if 'mask' in obj_data:
                                         obj_info['rle'] = obj_data['mask']
                                     obj_info_list.append(obj_info)
+                                    # 收集 patch id 用于与当前 grid 对齐的 sanity check
+                                    try:
+                                        patch_ids_all.extend([int(p) for p in obj_info['patches']])
+                                    except Exception:
+                                        pass
                             
                             # 如果找到了该物体的信息（可能来自1-2个视角）
                             if obj_info_list:
@@ -259,14 +265,9 @@ class PaDT_PI(baseframework):
                         return match.group(0)
                     return processor.pid2vrt(picked)
 
-                completion = re.sub(r'<\|Obj_(\d+)\|>', _obj_to_vrt, completion_raw)
-
-                solution = {
-                    'text': completion,
-                    'objects': objects_info
-                }
-                solutions.append(solution)
-                completions.append(completion)
+                # 暂存原始 completion 与 objects_info，稍后重映射 patches 后再做 VRT 替换
+                completion_raw_list.append(completion_raw)
+                objects_infos_list.append(objects_info)
             else:
                 # 如果没有对话数据，跳过
                 return None
@@ -297,7 +298,121 @@ class PaDT_PI(baseframework):
         prompt_mask = prompt_inputs["attention_mask"]
         prompt_length = prompt_ids.size(1)
         
-        # Tokenize completions
+        # --- Patch remapping: align offline patches (computed at long-side 644, patch 28) to runtime grid ---
+        def _remap_patches(patches: list[int], off_h: int, off_w: int, rt_h: int, rt_w: int) -> list[int]:
+            if not patches or off_h <= 0 or off_w <= 0 or rt_h <= 0 or rt_w <= 0:
+                return patches
+            mapped: list[int] = []
+            for p in patches:
+                r_off = p // off_w
+                c_off = p % off_w
+                r_norm = (r_off + 0.5) / off_h
+                c_norm = (c_off + 0.5) / off_w
+                r_rt = int(torch.floor(torch.tensor(r_norm * rt_h)).item())
+                c_rt = int(torch.floor(torch.tensor(c_norm * rt_w)).item())
+                r_rt = max(0, min(rt_h - 1, r_rt))
+                c_rt = max(0, min(rt_w - 1, c_rt))
+                mapped.append(r_rt * rt_w + c_rt)
+            # 去重且保持稳定顺序
+            seen = set()
+            uniq = []
+            for m in mapped:
+                if m not in seen:
+                    seen.add(m)
+                    uniq.append(m)
+            return uniq
+
+        # 预计算每个 sample 的离线/在线网格尺寸（用每个样本的第一张图，假设多视角同分辨率）
+        grid_thw = prompt_inputs.get('image_grid_thw')
+        runtime_grid_hw = []  # [(rt_h, rt_w)] per sample
+        offline_grid_hw = []  # [(off_h, off_w)] per sample
+        if grid_thw is not None:
+            flat_orig_sizes = []
+            for imgs in batch_images:
+                if isinstance(imgs, (list, tuple)):
+                    flat_orig_sizes.extend([img.size for img in imgs])
+                else:
+                    flat_orig_sizes.append(imgs.size)
+            flat_idx = 0
+            for imgs in batch_images:
+                count = len(imgs) if isinstance(imgs, (list, tuple)) else 1
+                # runtime grid 用第一视角
+                if flat_idx < grid_thw.shape[0]:
+                    rt_h = int(grid_thw[flat_idx, 1].item())
+                    rt_w = int(grid_thw[flat_idx, 2].item())
+                else:
+                    rt_h = rt_w = 0
+                # offline grid 用第一视角原始尺寸
+                if flat_idx < len(flat_orig_sizes):
+                    ow, oh = flat_orig_sizes[flat_idx]
+                    scale = 644.0 / max(oh, ow)
+                    target_w = int(ow * scale)
+                    target_h = int(oh * scale)
+                    off_w = max(1, round(target_w / 28))
+                    off_h = max(1, round(target_h / 28))
+                else:
+                    off_h = off_w = 0
+                runtime_grid_hw.append((rt_h, rt_w))
+                offline_grid_hw.append((off_h, off_w))
+                flat_idx += count
+
+        # 按样本重映射 patches，并重新生成 completions（VRT token 与 runtime grid 对齐）
+        completions = []
+        solutions = []
+        if grid_thw is not None and runtime_grid_hw:
+            for sample_idx, (rt_hw, off_hw) in enumerate(zip(runtime_grid_hw, offline_grid_hw)):
+                if sample_idx >= len(objects_infos_list) or sample_idx >= len(completion_raw_list):
+                    break
+                rt_h, rt_w = rt_hw
+                off_h, off_w = off_hw
+                objects_info = objects_infos_list[sample_idx]
+                for obj_idx, obj_info_list in objects_info.items():
+                    for obj_info in obj_info_list:
+                        if 'patches' in obj_info:
+                            obj_info['patches'] = _remap_patches(obj_info['patches'], off_h, off_w, rt_h, rt_w)
+                completion_raw = completion_raw_list[sample_idx]
+
+                def _obj_to_vrt_runtime(match: re.Match) -> str:
+                    obj_idx = match.group(1)
+                    view_infos = objects_info.get(obj_idx, [])
+                    view_infos = [v for v in view_infos if v.get('patches')]
+                    if not view_infos:
+                        return match.group(0)
+                    ordered: list[dict] = []
+                    def _append_by_substring(subs: list[str]):
+                        for sub in subs:
+                            for v in view_infos:
+                                if sub in v.get('view', '') and v not in ordered:
+                                    ordered.append(v)
+                    _append_by_substring(["agent", "third", "ego"])
+                    _append_by_substring(["wrist", "hand"])
+                    for v in view_infos:
+                        if v not in ordered:
+                            ordered.append(v)
+                    picked: list[int] = []
+                    sample_n = 3
+                    for v in ordered:
+                        patches = [int(p) for p in v.get('patches', []) or []]
+                        if not patches:
+                            continue
+                        if len(patches) < sample_n:
+                            picked.extend([random.choice(patches) for _ in range(sample_n)])
+                        else:
+                            picked.extend(random.sample(patches, sample_n))
+                    if not picked:
+                        return match.group(0)
+                    return processor.pid2vrt(picked)
+
+                completion = re.sub(r'<\|Obj_(\d+)\|>', _obj_to_vrt_runtime, completion_raw)
+                completions.append(completion)
+                solutions.append({"text": completion, "objects": objects_info})
+        else:
+            # 回退：若无 grid 信息则直接使用原始 completion_raw（不推荐）
+            for completion_raw, objects_info in zip(completion_raw_list, objects_infos_list):
+                completions.append(completion_raw)
+                solutions.append({"text": completion_raw, "objects": objects_info})
+
+        # Tokenize completions（已对齐 runtime grid 的 VRT）
         completion_inputs = self.padt_vl_interface.processor(
             text=completions,
             return_tensors='pt',
@@ -308,10 +423,34 @@ class PaDT_PI(baseframework):
         completion_inputs = {k: v.to(self.padt_vl_interface.model.device) for k, v in completion_inputs.items()}
         completion_ids = completion_inputs["input_ids"]
         completion_mask = completion_inputs["attention_mask"]
-        
+
         # Concatenate for full sequence
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+
+        # 仅首次打印一次与 patches 对齐相关的关键信息，方便排查 VLM loss 是否错位
+        if not hasattr(self, "_logged_vlm_patch_debug") or not self._logged_vlm_patch_debug:
+            grid_info = grid_thw.detach().cpu().tolist() if grid_thw is not None else None
+            total_patches = None
+            if grid_thw is not None and grid_thw.numel() >= 3:
+                # grid_thw: [B, 3] -> t, h, w；实际视觉网格大小为 h*w
+                h = int(grid_thw[0, 1].item())
+                w = int(grid_thw[0, 2].item())
+                total_patches = h * w
+            min_patch = min(patch_ids_all) if patch_ids_all else None
+            max_patch = max(patch_ids_all) if patch_ids_all else None
+            logger.warning(
+                "[VLM loss debug] vlm_image_size=%s, image_grid_thw=%s, total_patches=%s, patch_id_min=%s, patch_id_max=%s, images_per_sample=%s, rt_hw_sample0=%s, off_hw_sample0=%s",
+                vlm_image_size,
+                grid_info,
+                total_patches,
+                min_patch,
+                max_patch,
+                images_per_sample,
+                runtime_grid_hw[0] if runtime_grid_hw else None,
+                offline_grid_hw[0] if offline_grid_hw else None,
+            )
+            self._logged_vlm_patch_debug = True
 
         # 重新映射 VRT token 到全局 ID（与 PaDT 训练对齐）
         if prompt_inputs.get('image_grid_thw') is not None:
@@ -323,14 +462,14 @@ class PaDT_PI(baseframework):
             'pixel_values': prompt_inputs.get('pixel_values')
         }
         
-        # Forward pass（用 no_grad 避免存储中间激活值，大幅节省显存）
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        # Forward pass with gradients enabled for VLM
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             model_output = self.padt_vl_interface.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 **multimodal_inputs
             )
-            logits = model_output.logits[:, prompt_length-1:-1, :].detach()  # (B, L, V)
+            logits = model_output.logits[:, prompt_length-1:-1, :]  # (B, L, V)
         
         # Compute token loss（在 no_grad 外计算，但 logits 已 detach，不回传 VLM 梯度）
         target_ids = input_ids[:, prompt_length:]  # (B, L)
@@ -386,7 +525,13 @@ class PaDT_PI(baseframework):
             # 取与 DiT 层数匹配的最后 N 层隐藏态，按层喂给 DiT
             all_hidden = padt_outputs.hidden_states
             expected_layers = len(self.action_model.model.transformer_blocks)
-            vl_embs_list = list(all_hidden[-expected_layers:])
+            # detach VLM features for action head: action loss only trains DiT,
+            # VLM loss only trains VLM — prevents gradient conflict
+            detach_action_features = getattr(self.config.trainer, "detach_action_features", False) if self.config and self.config.trainer else False
+            if detach_action_features:
+                vl_embs_list = [h.detach() for h in all_hidden[-expected_layers:]]
+            else:
+                vl_embs_list = list(all_hidden[-expected_layers:])
             base_hidden = vl_embs_list[-1]
 
         # Step 4: Action Expert Forward and Loss
@@ -400,7 +545,7 @@ class PaDT_PI(baseframework):
             repeated_diffusion_steps = (
                 self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
             )
-            repeated_diffusion_steps = 2 # NO repeat for big action FM
+            repeated_diffusion_steps = 2 # NO repeat for big action FM (use config value instead)
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             # 对每层特征做 repeat
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]
