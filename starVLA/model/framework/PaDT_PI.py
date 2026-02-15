@@ -16,6 +16,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import PIL.Image
+import PIL.ImageDraw
+import torch.distributed as dist
 
 
 
@@ -149,19 +151,138 @@ class PaDT_PI(baseframework):
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
+        trainer_cfg = getattr(self.config, "trainer", None)
+        self.debug_vrt = bool(getattr(trainer_cfg, "debug_vrt", False))
+        self.debug_vrt_max_steps = int(getattr(trainer_cfg, "debug_vrt_max_steps", 20))
+        self.debug_vrt_token_preview = int(getattr(trainer_cfg, "debug_vrt_token_preview", 12))
+        self.debug_vrt_visualize = bool(getattr(trainer_cfg, "debug_vrt_visualize", self.debug_vrt))
+        self.debug_vrt_visualize_max_samples = int(getattr(trainer_cfg, "debug_vrt_visualize_max_samples", 2))
+        self._debug_vrt_step = 0
+        self._debug_vrt_vis_count = 0
+        output_dir = str(getattr(self.config, "output_dir", "."))
+        self.debug_vrt_vis_dir = str(
+            getattr(trainer_cfg, "debug_vrt_visualize_dir", os.path.join(output_dir, "vrt_debug_vis"))
+        )
+        if self.debug_vrt_visualize and self._is_main_process():
+            os.makedirs(self.debug_vrt_vis_dir, exist_ok=True)
+        self.padt_vl_interface.processor.debug_vrt = self.debug_vrt
+        self.padt_vl_interface.processor.debug_vrt_max_calls = self.debug_vrt_max_steps
+        self.padt_vl_interface.processor.debug_vrt_token_preview = self.debug_vrt_token_preview
+
+    def _is_main_process(self) -> bool:
+        return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+
+    def _vrt_debug_this_step(self) -> bool:
+        return self.debug_vrt and self._is_main_process() and self._debug_vrt_step < self.debug_vrt_max_steps
+
+    def _vrt_log(self, message: str) -> None:
+        logger.info(f"[VRTDBG] {message}")
+
+    @staticmethod
+    def _patch_box_from_pid(pid: int, patch_w: int, patch_h: int, img_w: int, img_h: int) -> Tuple[int, int, int, int]:
+        patch_x = int(pid % patch_w)
+        patch_y = int(pid // patch_w)
+        px_w = img_w / float(patch_w)
+        px_h = img_h / float(patch_h)
+        x0 = int(round(patch_x * px_w))
+        y0 = int(round(patch_y * px_h))
+        x1 = int(round((patch_x + 1) * px_w))
+        y1 = int(round((patch_y + 1) * px_h))
+        return x0, y0, x1, y1
+
+    def _save_vrt_patch_visualization(
+        self,
+        sample_images: List[PIL.Image.Image],
+        sample_records: List[dict],
+        patch_w: int,
+        patch_h: int,
+        debug_step: int,
+        sample_idx: int,
+    ) -> Optional[str]:
+        if not self.debug_vrt_visualize or not self._is_main_process():
+            return None
+        if len(sample_images) == 0:
+            return None
+
+        # Use a fixed color palette for object-level consistency inside one sample.
+        colors = [
+            (255, 80, 80),
+            (80, 180, 255),
+            (80, 220, 120),
+            (255, 190, 80),
+            (200, 120, 255),
+            (255, 120, 200),
+        ]
+
+        vis_images: List[PIL.Image.Image] = []
+        for view_id, img in enumerate(sample_images):
+            vis = to_pil_preserve(img).copy().convert("RGB")
+            draw = PIL.ImageDraw.Draw(vis, "RGBA")
+            for rec_idx, rec in enumerate(sample_records):
+                color = colors[rec_idx % len(colors)]
+                label_text = rec.get("label", "") or rec.get("obj_token", "obj")
+
+                # Draw all candidate patches in this view (thin line).
+                for pid, vid in zip(rec.get("candidate_local", []), rec.get("candidate_view_ids", [])):
+                    if int(vid) != view_id:
+                        continue
+                    x0, y0, x1, y1 = self._patch_box_from_pid(int(pid), patch_w, patch_h, vis.width, vis.height)
+                    draw.rectangle((x0, y0, x1, y1), outline=(*color, 180), width=1)
+
+                # Draw selected patches in this view (thick line + text).
+                for pid, vid in zip(rec.get("picked_local", []), rec.get("picked_view_ids", [])):
+                    if int(vid) != view_id:
+                        continue
+                    x0, y0, x1, y1 = self._patch_box_from_pid(int(pid), patch_w, patch_h, vis.width, vis.height)
+                    draw.rectangle((x0, y0, x1, y1), outline=(*color, 255), width=3)
+                    text_bg = (x0, max(0, y0 - 14), min(vis.width, x0 + 140), y0)
+                    draw.rectangle(text_bg, fill=(0, 0, 0, 150))
+                    draw.text((x0 + 2, max(0, y0 - 13)), label_text, fill=(255, 255, 255, 255))
+
+            # View title.
+            view_name = "agentview" if view_id == 0 else "wrist"
+            draw.rectangle((0, 0, 160, 16), fill=(0, 0, 0, 180))
+            draw.text((4, 2), view_name, fill=(255, 255, 255, 255))
+            vis_images.append(vis)
+
+        canvas_w = sum(im.width for im in vis_images)
+        canvas_h = max(im.height for im in vis_images)
+        canvas = PIL.Image.new("RGB", (canvas_w, canvas_h), color=(20, 20, 20))
+        x_offset = 0
+        for im in vis_images:
+            canvas.paste(im, (x_offset, 0))
+            x_offset += im.width
+
+        save_path = os.path.join(
+            self.debug_vrt_vis_dir,
+            f"step_{debug_step:05d}_sample_{sample_idx:02d}.png",
+        )
+        canvas.save(save_path)
+        return save_path
 
     def compute_vlm_loss(self, model, examples: List[dict], batch_images :List[List[PIL.Image.Image]], padt_vlm_inputs: List[dict]) -> Optional[torch.Tensor]:
         
         prompt_text = padt_vlm_inputs
+        debug_this_step = self._vrt_debug_this_step()
+        if debug_this_step:
+            self._debug_vrt_step += 1
+            self._vrt_log(
+                f"compute_vlm_loss step={self._debug_vrt_step} batch_size={len(examples)} "
+                f"prompt_example={repr(prompt_text[0][:200] if len(prompt_text) > 0 else '')}"
+            )
 
         completions = []
         solutions = []
+        preview_n = max(1, int(self.debug_vrt_token_preview))
 
         for idx, x in enumerate(examples):
-            image_1 = PIL.Image.open(batch_images[idx][0])
-            print(f"image_1 size: {image_1.size}")
-            image_2 = PIL.Image.open(batch_images[idx][1])
-            print(f"image_2 size: {image_2.size}")
+            image_1 = batch_images[idx][0]
+            image_2 = batch_images[idx][1] if len(batch_images[idx]) > 1 else None
+            if debug_this_step and idx < 2:
+                self._vrt_log(
+                    f"sample={idx} image_sizes="
+                    f"{getattr(image_1, 'size', None)}, {getattr(image_2, 'size', None)}"
+                )
 
             # completion
             im_w, im_h = batch_images[idx][0].size
@@ -172,6 +293,10 @@ class PaDT_PI(baseframework):
             pattern = r'(<\|Obj_(\d+)\|>)'
             obj_in_completion = re.findall(pattern, completion)
             obj_strs = [i[0] for i in obj_in_completion]
+            if debug_this_step and idx == 0:
+                self._vrt_log(
+                    f"sample=0 obj_in_completion={obj_strs} answer_template={repr(completion[:200])}"
+                )
 
             seg = x.get('seg', {})
             if isinstance(seg, list):
@@ -182,6 +307,7 @@ class PaDT_PI(baseframework):
             agent_objs = [agentview_seg.get(str(i[1])) for i in obj_in_completion]
             wrist_objs = [wrist_seg.get(str(i[1])) for i in obj_in_completion]
             merged_objs = []
+            sample_vis_records = []
             for agent_obj, wrist_obj in zip(agent_objs, wrist_objs):
                 if not isinstance(agent_obj, dict) and not isinstance(wrist_obj, dict):
                     merged_objs.append(None)
@@ -192,12 +318,22 @@ class PaDT_PI(baseframework):
                 merged_patch_view_ids = []
                 if isinstance(agent_obj, dict):
                     obj_merged.update(agent_obj)
+                    if "label" not in obj_merged:
+                        obj_merged["label"] = (
+                            agent_obj.get("label")
+                            or (agent_obj.get("mask", {}) or {}).get("label", "")
+                        )
                     agent_patches = [int(p) for p in (agent_obj.get('patches', []) or [])]
                     merged_patches.extend(agent_patches)
                     merged_patch_view_ids.extend([0] * len(agent_patches))  # 0 -> agent (image[0])
                 if isinstance(wrist_obj, dict):
                     if not obj_merged:
                         obj_merged.update(wrist_obj)
+                    if not obj_merged.get("label"):
+                        obj_merged["label"] = (
+                            wrist_obj.get("label")
+                            or (wrist_obj.get("mask", {}) or {}).get("label", "")
+                        )
                     wrist_patches = [int(p) for p in (wrist_obj.get('patches', []) or [])]
                     merged_patches.extend(wrist_patches)
                     merged_patch_view_ids.extend([1] * len(wrist_patches))  # 1 -> wrist (image[1])
@@ -231,6 +367,12 @@ class PaDT_PI(baseframework):
                 # view 0 uses [0..P-1], view 1 uses [P..2P-1], ...视角偏移
                 per_view_patch_num = patch_w * patch_h
                 selected_patches_global = selected_patches + selected_patch_view_ids * per_view_patch_num
+                if debug_this_step and idx == 0:
+                    self._vrt_log(
+                        f"obj={obj_str} local_patches={selected_patches[:preview_n].tolist()} "
+                        f"view_ids={selected_patch_view_ids[:preview_n].tolist()} "
+                        f"global_patches={selected_patches_global[:preview_n].tolist()}"
+                    )
 
                 # Per-view center selection:
                 # choose one center patch for each available view (agent/wrist).
@@ -268,6 +410,22 @@ class PaDT_PI(baseframework):
                 obj_['picked_local'] = pick_patch_local
                 obj_['picked_view_ids'] = selected_patch_view_ids[pick_idx]
                 new_objs.append(obj_)
+                if debug_this_step and idx < self.debug_vrt_visualize_max_samples:
+                    sample_vis_records.append(
+                        {
+                            "obj_token": obj_str,
+                            "label": obj_.get("label", obj_str),
+                            "candidate_local": selected_patches.tolist(),
+                            "candidate_view_ids": selected_patch_view_ids.tolist(),
+                            "picked_local": pick_patch_local.tolist(),
+                            "picked_view_ids": selected_patch_view_ids[pick_idx].tolist(),
+                        }
+                    )
+                if debug_this_step and idx == 0:
+                    self._vrt_log(
+                        f"obj={obj_str} picked_local={pick_patch_local.tolist()} "
+                        f"picked_global={pick_patch.tolist()} picked_view_ids={selected_patch_view_ids[pick_idx].tolist()}"
+                    )
                 completion_with_vrt += self.padt_vl_interface.processor.pid2vrt(pick_patch) + completion_part
 
             solutions.append({
@@ -275,6 +433,23 @@ class PaDT_PI(baseframework):
                 'objects': new_objs
             })
             completions.append(completion_with_vrt + self.padt_vl_interface.processor.tokenizer.eos_token)
+            if debug_this_step and idx < self.debug_vrt_visualize_max_samples and len(sample_vis_records) > 0:
+                vis_path = self._save_vrt_patch_visualization(
+                    sample_images=batch_images[idx],
+                    sample_records=sample_vis_records,
+                    patch_w=patch_w,
+                    patch_h=patch_h,
+                    debug_step=self._debug_vrt_step,
+                    sample_idx=idx,
+                )
+                if vis_path is not None:
+                    self._vrt_log(f"saved_patch_vis={vis_path}")
+
+        if debug_this_step and len(completions) > 0:
+            self._vrt_log(
+                f"completion_with_vrt_example={repr(completions[0][:300])} "
+                f"vrt_count_in_completion={completions[0].count('<|VRT_')}"
+            )
 
         # tokenizing
         prompt_inputs = self.padt_vl_interface.processor(
@@ -304,6 +479,11 @@ class PaDT_PI(baseframework):
             len(imgs) if isinstance(imgs, (list, tuple)) else 1
             for imgs in batch_images
         ]
+        if debug_this_step:
+            self._vrt_log(
+                f"tokenize prompt_length={prompt_length} model_embed_token_size={model_embed_token_size} "
+                f"images_per_sample={images_per_sample} image_grid_thw={multimodal_inputs['image_grid_thw'].tolist()}"
+            )
         
         completion_inputs = self.padt_vl_interface.processor(
             text=completions,
@@ -329,6 +509,11 @@ class PaDT_PI(baseframework):
         sample_patch_nums = torch.stack(sample_patch_nums)
         sample_patch_offsets = torch.nn.functional.pad(sample_patch_nums.cumsum(-1), (1, 0), 'constant', 0)[:-1]
         all_vision_patch_nums = int(sample_patch_nums.sum().item())
+        if debug_this_step:
+            self._vrt_log(
+                f"per_image_patch_nums={per_image_patch_nums.tolist()} sample_patch_nums={sample_patch_nums.tolist()} "
+                f"sample_patch_offsets={sample_patch_offsets.tolist()} all_vision_patch_nums={all_vision_patch_nums}"
+            )
 
         for sol, vpn in zip(solutions, sample_patch_offsets):
             vpn_i = int(vpn.item())
@@ -341,6 +526,8 @@ class PaDT_PI(baseframework):
                 gt_bboxes.append(obj['bbox'])
 
         if len(loss_masks) == 0:
+            if debug_this_step:
+                self._vrt_log("no valid objects for VLM loss in this batch -> return None")
             return None
 
         loss_masks = torch.cat(loss_masks, dim=0)
@@ -352,12 +539,22 @@ class PaDT_PI(baseframework):
         # Concatenate for full sequence
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        pre_global_ids = input_ids.clone() if debug_this_step else None
 
         input_ids = self.padt_vl_interface.processor.assign_to_global_vrt_id(
             input_ids,
             multimodal_inputs['image_grid_thw'],
             images_per_sample=images_per_sample,
         )
+        if debug_this_step:
+            pre_mask = pre_global_ids >= model_embed_token_size
+            post_mask = input_ids >= model_embed_token_size
+            pre_vrt = pre_global_ids[pre_mask][:preview_n].tolist()
+            post_vrt = input_ids[post_mask][:preview_n].tolist()
+            self._vrt_log(
+                f"assign_to_global_vrt_id pre_vrt_head={pre_vrt} post_vrt_head={post_vrt} "
+                f"pre_vrt_count={int(pre_mask.sum().item())} post_vrt_count={int(post_mask.sum().item())}"
+            )
 
         # Get the current policy's log probabilities
         model_output = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **multimodal_inputs)
@@ -367,6 +564,11 @@ class PaDT_PI(baseframework):
         if use_sft_vp_mask:
             visual_patch_mask = input_ids >= model_embed_token_size
             logits[visual_patch_mask] = logits[visual_patch_mask].masked_fill(loss_masks, float('-inf'))
+            if debug_this_step:
+                self._vrt_log(
+                    f"use_sft_vp_mask visual_patch_tokens={int(visual_patch_mask.sum().item())} "
+                    f"loss_masks_shape={tuple(loss_masks.shape)} logits_shape={tuple(logits.shape)}"
+                )
         
         # # decode to bbox
         # hidden_states = torch.stack(model_output.hidden_states, dim=1)[:, -1:, prompt_length-1:-1].permute(2, 1, 0, 3).unsqueeze(dim=-2).contiguous() # [BS, Layers, N, Dim] -> [N, Layers, BS, 1, D]
@@ -405,6 +607,11 @@ class PaDT_PI(baseframework):
         token_log_prob = torch.gather(logit_log_probs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
         per_token_loss = -token_log_prob
         sft_loss = ((per_token_loss * completion_mask).sum(dim=-1) / (completion_mask.sum(dim=-1) + 1e-4)).to(logits.dtype)
+        if debug_this_step:
+            self._vrt_log(
+                f"sft_loss_mean={float(sft_loss.detach().mean().item()):.6f} "
+                f"completion_valid_tokens={completion_mask.sum(dim=-1).tolist()}"
+            )
         if hasattr(self, "_metrics") and isinstance(self._metrics, dict):
             if hasattr(self, "accelerator") and self.accelerator is not None:
                 sft_loss_metric = self.accelerator.gather_for_metrics(sft_loss).mean().item()
@@ -460,6 +667,12 @@ class PaDT_PI(baseframework):
         """
         batch_images = [example["image"] for example in examples]
         instructions = [example.get("lang", example.get("language")) for example in examples]  # [B, str]
+        if compute_vlm_loss and self._vrt_debug_this_step():
+            images_per_sample = [len(imgs) if isinstance(imgs, (list, tuple)) else 1 for imgs in batch_images]
+            self._vrt_log(
+                f"forward batch_size={len(examples)} compute_vlm_loss={compute_vlm_loss} "
+                f"images_per_sample={images_per_sample} instruction_example={repr((instructions[0] or '')[:160])}"
+            )
 
         # print(f"instruction: {instructions[0]}")
         actions = [example["action"] for example in examples]  # label [B， len, 7]
@@ -540,6 +753,8 @@ class PaDT_PI(baseframework):
             vlm_loss = self.compute_vlm_loss(model, examples, batch_images, padt_vlm_inputs)
             if vlm_loss is not None: 
                 output_dict["vlm_loss"] = vlm_loss
+            elif self._vrt_debug_this_step():
+                self._vrt_log("compute_vlm_loss returned None for this batch")
         
         return output_dict
 

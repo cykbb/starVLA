@@ -75,6 +75,11 @@ datasets:
 
 
 trainer:
+  debug_vrt: true
+  debug_vrt_max_steps: 20
+  debug_vrt_token_preview: 12
+  debug_vrt_visualize: true
+  debug_vrt_visualize_max_samples: 2
   epochs: 100
   max_train_steps: 100000
   num_warmup_steps: 5000

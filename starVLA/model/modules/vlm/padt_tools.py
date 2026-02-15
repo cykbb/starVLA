@@ -1,5 +1,9 @@
 import torch
+import torch.distributed as dist
+import logging
 from transformers.tokenization_utils import AddedToken
+
+logger = logging.getLogger(__name__)
 
 class VisonTextProcessingClass(object):
     def __init__(self, processing_class, spatial_merge_size=1):
@@ -34,7 +38,17 @@ class VisonTextProcessingClass(object):
         return parent_ret
     # 按“一个 sample = 两张图”先算每个 sample 的总 patch 数，再把 batch 里后续样本整体向后偏移：sample0: 0..511，sample1: 512..1023，...
     def assign_to_global_vrt_id(self, input_ids, image_grid_thw, images_per_sample=None):
+        debug_vrt = bool(getattr(self, "debug_vrt", False))
+        debug_max_calls = int(getattr(self, "debug_vrt_max_calls", 20))
+        debug_preview = int(getattr(self, "debug_vrt_token_preview", 12))
+        debug_call_count = int(getattr(self, "_debug_vrt_assign_call_count", 0))
+        is_main = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+        debug_this_call = debug_vrt and is_main and debug_call_count < debug_max_calls
+        if debug_this_call:
+            self._debug_vrt_assign_call_count = debug_call_count + 1
+
         visual_patch_mask = input_ids >= self.model_embed_token_size
+        before_vrt = input_ids[visual_patch_mask].clone() if debug_this_call and visual_patch_mask.any() else None
         if visual_patch_mask.sum() > 0:
             per_image_patches = image_grid_thw.cumprod(-1)[:, -1] // (self.spatial_merge_size ** 2)
 
@@ -55,6 +69,18 @@ class VisonTextProcessingClass(object):
 
             each_sample_image_patches_ = each_sample_image_patches[:-1, None].expand(-1, input_ids.shape[1])
             input_ids[visual_patch_mask] += each_sample_image_patches_[visual_patch_mask]
+            if debug_this_call:
+                after_vrt = input_ids[visual_patch_mask]
+                logger.info(
+                    "[VRTDBG] assign_to_global_vrt_id call=%s per_image_patches=%s sample_offsets=%s "
+                    "before_vrt_head=%s after_vrt_head=%s vrt_count=%s",
+                    self._debug_vrt_assign_call_count,
+                    per_image_patches.tolist(),
+                    each_sample_image_patches[:-1].tolist(),
+                    before_vrt[:debug_preview].tolist() if before_vrt is not None else [],
+                    after_vrt[:debug_preview].tolist(),
+                    int(after_vrt.numel()),
+                )
         return input_ids
     
     def assign_to_local_vrt_id(self, input_ids, image_grid_thw, images_per_sample=None):

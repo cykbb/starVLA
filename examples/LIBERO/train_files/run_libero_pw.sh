@@ -78,9 +78,10 @@ accelerate launch \
   --datasets.vla_data.per_device_batch_size 18 \
   --trainer.vla_data.video_backend torchvision_av \
   --trainer.freeze_modules ${freeze_module_list} \
-  --trainer.max_train_steps 30000 \
+  --trainer.max_train_steps 10 \
   --trainer.save_interval 5000 \
-  --trainer.logging_frequency 100 \
+  --trainer.logging_frequency 1 \
+  --trainer.debug_vrt_max_steps 10 \
   --trainer.eval_interval 1000 \
   --run_root_dir ${run_root_dir} \
   --run_id ${run_id} \
