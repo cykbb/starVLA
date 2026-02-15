@@ -10,7 +10,6 @@ from typing import List
 from tqdm import tqdm
 from typing import List, Optional, Tuple
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
@@ -26,6 +25,7 @@ logger = initialize_overwatch(__name__)
 IGNORE_INDEX = -100
 
 from starVLA.model.framework.base_framework import baseframework
+from starVLA.model.common_utils import resolve_llm_hidden_size
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import get_action_model, LayerwiseFlowmatchingActionHead
 from starVLA.training.trainer_utils.trainer_tools import resize_images
@@ -67,17 +67,7 @@ class Qwen_PI(baseframework):
 
         # dynamic get llm config (handle Qwen2.5-VL config without top-level hidden_size)
         num_vl_layers = 36
-        vl_config = self.qwen_vl_interface.model.config
-        llm_hidden_size = getattr(vl_config, "hidden_size", None)
-        if llm_hidden_size is None and hasattr(vl_config, "text_config"):
-            llm_hidden_size = getattr(vl_config.text_config, "hidden_size", None)
-        if llm_hidden_size is None:
-            model_core = getattr(self.qwen_vl_interface.model, "model", None)
-            embed_tokens = getattr(model_core, "embed_tokens", None)
-            if embed_tokens is not None and hasattr(embed_tokens, "weight"):
-                llm_hidden_size = embed_tokens.weight.shape[1]
-        if llm_hidden_size is None:
-            raise AttributeError("Cannot resolve llm hidden_size from Qwen2.5-VL config/model")
+        llm_hidden_size = resolve_llm_hidden_size(self.qwen_vl_interface.model)
         self.config.framework.qwenvl.vl_hidden_dim = llm_hidden_size
         self.config.framework.qwenvl.num_vl_layers = num_vl_layers
 

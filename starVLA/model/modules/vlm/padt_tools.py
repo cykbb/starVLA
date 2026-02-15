@@ -2,7 +2,7 @@ import torch
 from transformers.tokenization_utils import AddedToken
 
 class VisonTextProcessingClass(object):
-    def __init__(self, processing_class, spatial_merge_size=2):
+    def __init__(self, processing_class, spatial_merge_size=1):
         self.processing_class = processing_class
         self.spatial_merge_size = spatial_merge_size
         self.model_embed_token_size = len(processing_class.tokenizer.get_vocab())
@@ -32,26 +32,27 @@ class VisonTextProcessingClass(object):
         if 'image_grid_thw' in parent_ret:
             self.set_image_grid_thw(parent_ret['image_grid_thw'])
         return parent_ret
-    
+    # 按“一个 sample = 两张图”先算每个 sample 的总 patch 数，再把 batch 里后续样本整体向后偏移：sample0: 0..511，sample1: 512..1023，...
     def assign_to_global_vrt_id(self, input_ids, image_grid_thw, images_per_sample=None):
         visual_patch_mask = input_ids >= self.model_embed_token_size
         if visual_patch_mask.sum() > 0:
-            # 计算每张图的 patch 数
-            per_image_patches = image_grid_thw.cumprod(-1)[:, -1] // (self.spatial_merge_size ** 2)  # [N_total_images]
-            
+            per_image_patches = image_grid_thw.cumprod(-1)[:, -1] // (self.spatial_merge_size ** 2)
+
             if images_per_sample is not None and len(image_grid_thw) != input_ids.shape[0]:
-                # 多图模式：将每张图的 patch 数按 sample 分组求和，得到每个 sample 的总 patch 数
                 sample_total_patches = []
                 idx = 0
                 for n_imgs in images_per_sample:
                     sample_total_patches.append(per_image_patches[idx:idx + n_imgs].sum())
                     idx += n_imgs
-                sample_total_patches = torch.stack(sample_total_patches)  # [B]
-                each_sample_image_patches = torch.nn.functional.pad(sample_total_patches.cumsum(dim=-1), (1, 0), 'constant', 0)
+                sample_total_patches = torch.stack(sample_total_patches)
+                each_sample_image_patches = torch.nn.functional.pad(
+                    sample_total_patches.cumsum(dim=-1), (1, 0), "constant", 0
+                )
             else:
-                # 单图模式（原始逻辑）
-                each_sample_image_patches = torch.nn.functional.pad(per_image_patches.cumsum(dim=-1), (1, 0), 'constant', 0)
-            
+                each_sample_image_patches = torch.nn.functional.pad(
+                    per_image_patches.cumsum(dim=-1), (1, 0), "constant", 0
+                )
+
             each_sample_image_patches_ = each_sample_image_patches[:-1, None].expand(-1, input_ids.shape[1])
             input_ids[visual_patch_mask] += each_sample_image_patches_[visual_patch_mask]
         return input_ids
@@ -75,7 +76,7 @@ class VisonTextProcessingClass(object):
             each_sample_image_patches_ = each_sample_image_patches[:-1, None].expand(-1, input_ids.shape[1])
             input_ids[visual_patch_mask] -= each_sample_image_patches_[visual_patch_mask]
         return input_ids
-    
+    # 单个 sample、两张图、每图 16x16=256 patch 时：图0 用 0..255，图1 用 256..511
     def pid2vrt(self, patch_ids):
         if type(patch_ids) == int:
             patch_ids = [patch_ids]
@@ -94,7 +95,7 @@ def parseVRTintoCompletion(processor, completion_ids, hidden_states, need_thinki
     ret_vrts_feats = []
 
     if image_grid_thw is not None:
-        vision_patch_nums = torch.nn.functional.pad((image_grid_thw.cumprod(-1)[:, -1] // 4).cumsum(-1), (1, 0), 'constant', 0)
+        vision_patch_nums = torch.nn.functional.pad((image_grid_thw.cumprod(-1)[:, -1] // (processor.spatial_merge_size ** 2)).cumsum(-1), (1, 0), 'constant', 0)
     
     if need_thinking_mask is None:
         need_thinking_mask = torch.ones(len(completion_ids)).to(torch.bool)

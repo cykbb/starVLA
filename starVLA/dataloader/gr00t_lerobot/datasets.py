@@ -813,6 +813,54 @@ class LeRobotSingleDataset(Dataset):
         """
         self.epoch = epoch
 
+    @staticmethod
+    def _project_patch_indices_23_to_16(patches) -> list[int]:
+        """Project flattened patch indices from a 23x23 grid to a 16x16 grid."""
+        if patches is None:
+            return []
+        if not isinstance(patches, (list, tuple, np.ndarray)):
+            return []
+
+        src_h = src_w = 23
+        dst_h = dst_w = 16
+        mapped = []
+        for p in patches:
+            try:
+                p = int(p)
+            except (TypeError, ValueError):
+                continue
+            if p < 0 or p >= src_h * src_w:
+                continue
+
+            src_r = p // src_w
+            src_c = p % src_w
+
+            # Center-based projection from source grid cell to destination grid cell.
+            r_norm = (src_r + 0.5) / src_h
+            c_norm = (src_c + 0.5) / src_w
+            dst_r = min(dst_h - 1, max(0, int(r_norm * dst_h)))
+            dst_c = min(dst_w - 1, max(0, int(c_norm * dst_w)))
+            mapped.append(dst_r * dst_w + dst_c)
+
+        seen = set()
+        unique_mapped = []
+        for m in mapped:
+            if m not in seen:
+                seen.add(m)
+                unique_mapped.append(m)
+        return unique_mapped
+
+    def _project_segmentation_patches_23_to_16(self, seg_item):
+        """Project every object's `patches` field in segmentation dict from 23x23 to 16x16."""
+        if not isinstance(seg_item, dict):
+            return seg_item
+        for _, obj_data in seg_item.items():
+            if not isinstance(obj_data, dict):
+                continue
+            if "patches" in obj_data:
+                obj_data["patches"] = self._project_patch_indices_23_to_16(obj_data["patches"])
+        return seg_item
+
     def __len__(self) -> int:
         """Get the total number of data points in the dataset.
 
@@ -842,7 +890,7 @@ class LeRobotSingleDataset(Dataset):
         images = []
         for video_key in self.modality_keys["video"]:
             image = data[video_key][0]  # first frame
-            image = Image.fromarray(image).resize((256, 256))
+            image = Image.fromarray(image).resize((224, 224))
             images.append(image)
         
         # Get language and action data
@@ -866,6 +914,7 @@ class LeRobotSingleDataset(Dataset):
                     view_name = k.replace("segmentation.", "")
                     seg_item = seg_list[idx]
                     view_dict[view_name] = json.loads(seg_item) if isinstance(seg_item, str) else seg_item
+                    view_dict[view_name] = self._project_segmentation_patches_23_to_16(view_dict[view_name])
                 result["seg"] = [view_dict]
         
         # Add answers data if available
@@ -1803,7 +1852,7 @@ class LeRobotMixtureDataset(Dataset):
                     
                     # Apply image cropping if enabled and the video key is base_view
                     # Note: crop_obs_camera functionality has been removed
-                    image = Image.fromarray(image).resize((256, 256))
+                    image = Image.fromarray(image).resize((224, 224))
                     if "wrist" not in video_key:
                         prim_images.append(image)
                     else:
@@ -1832,6 +1881,7 @@ class LeRobotMixtureDataset(Dataset):
                                 view_name = k.replace("segmentation.", "")
                                 seg_item = seg_list[idx]
                                 view_dict[view_name] = json.loads(seg_item) if isinstance(seg_item, str) else seg_item
+                                view_dict[view_name] = dataset._project_segmentation_patches_23_to_16(view_dict[view_name])
                             result["seg"] = [view_dict]
                 
                 # Add answers data if configured

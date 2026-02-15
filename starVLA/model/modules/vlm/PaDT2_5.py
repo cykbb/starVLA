@@ -13,6 +13,10 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import BatchFeature
 
 from qwen_vl_utils import process_vision_info
+try:
+    from ...common_utils import get_input_embedding_vocab_size
+except ImportError:
+    from starVLA.model.common_utils import get_input_embedding_vocab_size
 
 try:
     from .padt import PaDTForConditionalGeneration
@@ -95,16 +99,39 @@ class _PaDT_VL_Interface(nn.Module):
             attn_implementation="flash_attention_2",
             torch_dtype="auto",
         )
+
+        # Force visual merge granularity for VRT/patch alignment (default: 1 => 14x14 @224).
+        target_merge_size = int(qwenvl_config.get("spatial_merge_size", 1))
+        if target_merge_size < 1:
+            raise ValueError(f"Invalid spatial_merge_size={target_merge_size}, expected >= 1")
+        orig_merge_size = int(getattr(model.config.vision_config, "spatial_merge_size", 2))
+        model.config.vision_config.spatial_merge_size = target_merge_size
+        updated_modules = 0
+        for m in model.modules():
+            if hasattr(m, "spatial_merge_size"):
+                setattr(m, "spatial_merge_size", target_merge_size)
+                updated_modules += 1
+            if hasattr(m, "spatial_merge_unit"):
+                setattr(m, "spatial_merge_unit", target_merge_size ** 2)
+                updated_modules += 1
+        if orig_merge_size != target_merge_size:
+            logger.warning(
+                "Override vision spatial_merge_size: %s -> %s (updated attrs: %s)",
+                orig_merge_size,
+                target_merge_size,
+                updated_modules,
+            )
+
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
         # Wrap processor to support VRT tokens and pid2vrt helpers
         processor = VisonTextProcessingClass(
             processor,
-            getattr(model.config.vision_config, "spatial_merge_size", 2),
+            spatial_merge_size=target_merge_size,
         )
         # Align tokenizer vocab with model embedding size
-        processor.prepare(model.get_input_embeddings().weight.shape[0])
+        processor.prepare(get_input_embedding_vocab_size(model))
 
         self.model = model
         self.processor = processor
@@ -275,6 +302,39 @@ class _PaDT_VL_Interface(nn.Module):
         #     batch_input['labels'] = labels
 
         return batch_input.to(self.model.device)
+    def build_padtvl_vlm_inputs(self, images, vlm_instructions, **kwargs):
+        """
+        Construct and tokenize multimodal chat-style inputs for Qwen2.5-VL (batched).
+
+        Parameters:
+            images (List[List[PIL.Image.Image]]): Length B, each element is list of PIL images
+            vlm_instructions (List[str]): Length B, textual prompts for VLM
+            solutions (List[str], optional): For training labels
+            **kwargs: Reserved for future extensions
+
+        Returns:
+            BatchFeature: HF-standard structure with input_ids, attention_mask, pixel_values, etc.
+        """
+        # Create messages: one message per sample
+        messages = []
+        assert len(images) == len(vlm_instructions), "Images and instructions must have the same length"
+        
+        for imgs, instruction in zip(images, vlm_instructions):
+            content = [{"type": "image", "image": img} for img in imgs]
+
+            prompt = instruction
+
+            content.append({"type": "text", "text": prompt})
+            msg = [{"role": "user", "content": content}]
+
+            messages.append(msg)
+
+        # Prepare text prompts
+        texts = [self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in messages]
+
+
+        return texts
+
 
 if __name__ == "__main__":
     from omegaconf import OmegaConf

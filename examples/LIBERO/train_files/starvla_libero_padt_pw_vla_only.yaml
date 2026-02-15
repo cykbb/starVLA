@@ -12,6 +12,11 @@ framework:
   qwenvl:
     base_vlm: ./playground/Pretrained_models/PaDT_Pro_3B
     attn_implementation: flash_attention_2
+    spatial_merge_size: 1
+    max_vrt_patches: 512
+    images_per_sample: 2
+    min_required_vrt_patches: 512
+    strict_vrt_init: true
     vl_hidden_dim: 2048
   dino:
     dino_backbone: dinov2_vits14
@@ -55,7 +60,8 @@ datasets:
     action_type: delta_qpos
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     CoT_answer: bbox
-    default_image_resolution: [3, 256, 256]
+    image_size: 224
+    default_image_resolution: [3, 224, 224]
     per_device_batch_size: 32
     dataloader_num_workers: 8
     prefetch_factor: 2

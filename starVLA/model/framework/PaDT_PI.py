@@ -6,14 +6,16 @@ Qwen-GROOT Framework
 A lightweight implementation that Qwen2.5-vl + Flow-matching head to directly predict continuous actions
 Flow-matching header is copyright from GR00T N1.5, but a sample MoE inspired by PI_0
 """
+import re
+import os
+import cv2
 from typing import List
 from tqdm import tqdm
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple,Union,Sized
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from PIL import Image
+import PIL.Image
 
 
 
@@ -24,10 +26,9 @@ logger = initialize_overwatch(__name__)
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
-
 from starVLA.model.framework.base_framework import baseframework
+from starVLA.model.common_utils import get_input_embedding_vocab_size, resolve_llm_hidden_size
 from starVLA.model.modules.vlm import get_vlm_model
-from starVLA.model.modules.vlm.padt import PaDTForConditionalGeneration
 from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import get_action_model, LayerwiseFlowmatchingActionHead
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
@@ -65,47 +66,81 @@ class PaDT_PI(baseframework):
         super().__init__()
         self.config = config
         self.padt_vl_interface = get_vlm_model(config=self.config)
-        model_cls = PaDTForConditionalGeneration
-        
+        qwenvl_cfg = (
+            self.config.framework.qwenvl
+            if hasattr(self.config, "framework") and hasattr(self.config.framework, "qwenvl")
+            else None
+        )
+        strict_vrt_init = bool(qwenvl_cfg.get("strict_vrt_init", True)) if qwenvl_cfg is not None else True
         # Pre-reserve VRT tokens and resize embeddings once BEFORE deepspeed/accelerate wraps the model
         try:
-            merge_size = getattr(self.padt_vl_interface.processor, "spatial_merge_size", 2)
-            max_vrt_patches = (
-                self.config.framework.qwenvl.get("max_vrt_patches", None)
-                if hasattr(self.config, "framework") and hasattr(self.config.framework, "qwenvl")
-                else None
-            )
+            merge_size = int(getattr(self.padt_vl_interface.processor, "spatial_merge_size", 1))
+            if merge_size < 1:
+                raise ValueError(f"Invalid spatial_merge_size={merge_size}, expected >= 1")
+
+            max_vrt_patches = qwenvl_cfg.get("max_vrt_patches", None) if qwenvl_cfg is not None else None
             if max_vrt_patches is None:
                 # conservative default: 4096 visual patches per sample
                 max_vrt_patches = 4096
+            max_vrt_patches = int(max_vrt_patches)
+
+            # Minimum required VRT patches for one sample (default assumes 2 views for PaDTPI).
+            image_size_cfg = getattr(getattr(getattr(self.config, "datasets", None), "vla_data", None), "image_size", 224)
+            if isinstance(image_size_cfg, (list, tuple)):
+                image_size = int(image_size_cfg[0])
+            else:
+                image_size = int(image_size_cfg)
+            patches_per_side = max(1, image_size // 14)
+            per_image_vrt_patches = max(1, (patches_per_side * patches_per_side) // (merge_size ** 2))
+            images_per_sample = int(qwenvl_cfg.get("images_per_sample", 2)) if qwenvl_cfg is not None else 2
+            min_required_vrt_patches = (
+                int(qwenvl_cfg.get("min_required_vrt_patches", per_image_vrt_patches * images_per_sample))
+                if qwenvl_cfg is not None
+                else per_image_vrt_patches * images_per_sample
+            )
+            if max_vrt_patches < min_required_vrt_patches:
+                msg = (
+                    f"max_vrt_patches={max_vrt_patches} is smaller than minimum required "
+                    f"{min_required_vrt_patches} (image_size={image_size}, merge_size={merge_size}, "
+                    f"images_per_sample={images_per_sample})"
+                )
+                if strict_vrt_init:
+                    raise ValueError(msg)
+                logger.warning(msg + "; auto-upgrade max_vrt_patches to minimum required.")
+                max_vrt_patches = min_required_vrt_patches
+
             # grid_thw so that t*h*w / merge_size^2 == max_vrt_patches
             grid_thw = torch.tensor([[1, 1, max_vrt_patches * (merge_size ** 2)]], dtype=torch.int64)
             # add tokens to tokenizer if needed
             self.padt_vl_interface.processor.set_image_grid_thw(grid_thw)
             tok_len = len(self.padt_vl_interface.processor.tokenizer)
-            embed_len = self.padt_vl_interface.model.get_input_embeddings().weight.shape[0]
+            embed_len = get_input_embedding_vocab_size(self.padt_vl_interface.model)
             if tok_len > embed_len:
                 self.padt_vl_interface.model.resize_token_embeddings(tok_len, mean_resizing=False)
-            if hasattr(self.padt_vl_interface.processor, "model_embed_token_size"):
-                self.padt_vl_interface.processor.model_embed_token_size = len(self.padt_vl_interface.processor.tokenizer)
+            # Keep base embedding vocab size (not tokenizer length after adding VRT tokens).
+            self.padt_vl_interface.processor.model_embed_token_size = embed_len
         except Exception as e:
-            logger.warning(f"VRT pre-resize failed, training may resize at runtime: {e}")
+            msg = f"VRT pre-resize failed: {e}"
+            if strict_vrt_init:
+                raise RuntimeError(msg) from e
+            logger.warning(msg + "; training may resize at runtime.")
         
 
         # dynamic get llm config (Qwen2.5 VL configs sometimes omit top-level hidden_size)
-        vl_config = self.padt_vl_interface.model.config
-        llm_hidden_size = getattr(vl_config, "hidden_size", None)
-        if llm_hidden_size is None and hasattr(vl_config, "text_config"):
-            llm_hidden_size = getattr(vl_config.text_config, "hidden_size", None)
-        if llm_hidden_size is None:
-            model_core = getattr(self.padt_vl_interface.model, "model", None)
-            embed_tokens = getattr(model_core, "embed_tokens", None)
-            if embed_tokens is not None and hasattr(embed_tokens, "weight"):
-                llm_hidden_size = embed_tokens.weight.shape[1]
-        if llm_hidden_size is None:
-            raise AttributeError("Cannot resolve llm hidden_size from Qwen2_5_VL config/model")
+        llm_hidden_size = resolve_llm_hidden_size(self.padt_vl_interface.model)
 
-        num_vl_layers = 36
+        vl_config = self.padt_vl_interface.model.config
+        num_vl_layers = getattr(vl_config, "num_hidden_layers", None)
+        if num_vl_layers is None and hasattr(vl_config, "text_config"):
+            num_vl_layers = getattr(vl_config.text_config, "num_hidden_layers", None)
+        if num_vl_layers is None:
+            model_core = getattr(self.padt_vl_interface.model, "model", None)
+            layers = getattr(model_core, "layers", None)
+            if layers is not None:
+                num_vl_layers = len(layers)
+        if num_vl_layers is None:
+            raise AttributeError("Cannot resolve num_vl_layers from Qwen2_5_VL config/model")
+        num_vl_layers = int(num_vl_layers)
         self.config.framework.qwenvl.vl_hidden_dim = llm_hidden_size
         self.config.framework.qwenvl.num_vl_layers = num_vl_layers
 
@@ -114,305 +149,162 @@ class PaDT_PI(baseframework):
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
-        
 
-    def compute_vlm_loss(
-        self,
-        examples: List[dict],
-        batch_images: List[List[Image.Image]],
-        instructions: List[str],
-    ) -> torch.Tensor:
-        """
-        Compute VLM loss based on answers and segmentation data.
+    def compute_vlm_loss(self, model, examples: List[dict], batch_images :List[List[PIL.Image.Image]], padt_vlm_inputs: List[dict]) -> Optional[torch.Tensor]:
         
-        Args:
-            examples: List[dict] containing answers and segmentation data
-            batch_images: List of image lists [B, [PIL.Image]]
-            instructions: List of instruction strings [B]
+        prompt_text = padt_vlm_inputs
+
+        completions = []
+        solutions = []
+
+        for idx, x in enumerate(examples):
+            image_1 = PIL.Image.open(batch_images[idx][0])
+            print(f"image_1 size: {image_1.size}")
+            image_2 = PIL.Image.open(batch_images[idx][1])
+            print(f"image_2 size: {image_2.size}")
+
+            # completion
+            im_w, im_h = batch_images[idx][0].size
+            patch_w, patch_h = round(im_w / 14), round(im_h / 14)
+
+            solution = x.get('answers', {})
+            completion = solution.get('answer_template', "")
+            pattern = r'(<\|Obj_(\d+)\|>)'
+            obj_in_completion = re.findall(pattern, completion)
+            obj_strs = [i[0] for i in obj_in_completion]
+
+            seg = x.get('seg', {})
+            if isinstance(seg, list):
+                seg = seg[0] if len(seg) > 0 else {}
+            seg = seg if isinstance(seg, dict) else {}
+            agentview_seg = seg.get('agentview_bbox_mask', {})
+            wrist_seg = seg.get('wrist_bbox_mask', {})
+            agent_objs = [agentview_seg.get(str(i[1])) for i in obj_in_completion]
+            wrist_objs = [wrist_seg.get(str(i[1])) for i in obj_in_completion]
+            merged_objs = []
+            for agent_obj, wrist_obj in zip(agent_objs, wrist_objs):
+                if not isinstance(agent_obj, dict) and not isinstance(wrist_obj, dict):
+                    merged_objs.append(None)
+                    continue
+
+                obj_merged = {}
+                merged_patches = []
+                merged_patch_view_ids = []
+                if isinstance(agent_obj, dict):
+                    obj_merged.update(agent_obj)
+                    agent_patches = [int(p) for p in (agent_obj.get('patches', []) or [])]
+                    merged_patches.extend(agent_patches)
+                    merged_patch_view_ids.extend([0] * len(agent_patches))  # 0 -> agent (image[0])
+                if isinstance(wrist_obj, dict):
+                    if not obj_merged:
+                        obj_merged.update(wrist_obj)
+                    wrist_patches = [int(p) for p in (wrist_obj.get('patches', []) or [])]
+                    merged_patches.extend(wrist_patches)
+                    merged_patch_view_ids.extend([1] * len(wrist_patches))  # 1 -> wrist (image[1])
+
+                if len(merged_patches) == 0:
+                    merged_objs.append(None)
+                    continue
+                #  "patches": [agent_p1, agent_p2, ..., wrist_p1, wrist_p2, ...],
+                obj_merged['patches'] = merged_patches
+                #  "patch_view_ids": [0, 0, ..., 1, 1, ...]
+                obj_merged['patch_view_ids'] = merged_patch_view_ids            
+                merged_objs.append(obj_merged)
+
+            pattern_without_matching = r'<\|Obj_\d+\|>'
+            completion_parts = re.split(pattern_without_matching, completion)
             
-        Returns:
-            vlm_loss: torch.Tensor, language modeling loss
-        """
-        import json
-        import re
-        import random
+            completion_with_vrt = completion_parts[0]
+            new_objs = []
+            for obj_str, completion_part, obj in zip(obj_strs, completion_parts[1:], merged_objs):
+                if obj is None:
+                    completion_with_vrt += completion_part
+                    continue
+                obj_ = obj.copy()
+                selected_patches = np.array(obj_['patches'])
+                selected_patch_view_ids = np.array(
+                    obj_.get('patch_view_ids', [0] * len(selected_patches))
+                )
+                if selected_patch_view_ids.shape[0] != selected_patches.shape[0]: # 检查存的patch和view_id数量是否一致
+                    selected_patch_view_ids = np.zeros_like(selected_patches)
+                # sample-local global patch ids across multi-view images:
+                # view 0 uses [0..P-1], view 1 uses [P..2P-1], ...视角偏移
+                per_view_patch_num = patch_w * patch_h
+                selected_patches_global = selected_patches + selected_patch_view_ids * per_view_patch_num
 
-        processor = self.padt_vl_interface.processor
-        
-        # 检查是否有 answers 数据
-        if "answers" not in examples[0]:
-            return None
+                # Per-view center selection:
+                # choose one center patch for each available view (agent/wrist).
+                pick_idx_list = []
+                # 每个视角单独处理
+                for view_id in sorted(np.unique(selected_patch_view_ids).tolist()):
+                    view_mask = selected_patch_view_ids == view_id
+                    view_indices = np.where(view_mask)[0]
+                    if view_indices.size == 0:
+                        continue
+
+                    view_patches = selected_patches[view_indices]
+                    view_x = view_patches % patch_w
+                    view_y = view_patches // patch_w
+                    left_m = view_x == view_x.min()
+                    right_m = view_x == view_x.max()
+                    top_m = view_y == view_y.min()
+                    bottom_m = view_y == view_y.max()
+                    centre_m = (left_m + right_m + top_m + bottom_m) == 0
+
+                    centre_local = np.where(centre_m)[0]
+                    if centre_local.size == 0:
+                        centre_local = np.arange(view_indices.size)
+
+                    chosen_local = np.random.choice(centre_local)
+                    pick_idx_list.append(view_indices[chosen_local])
+
+
+                pick_idx = np.array(pick_idx_list, dtype=np.int64)
+                pick_patch_local = selected_patches[pick_idx]
+                pick_patch = selected_patches_global[pick_idx]
             
-        # 构建 prompt，收集 completion_raw 与 objects_info，稍后根据 runtime grid 重映射 patches 再生成 completion
-        prompts = []
-        completion_raw_list = []
-        objects_infos_list = []
-        patch_ids_all: list[int] = []  # collect offline patch ids to sanity-check with processor grid
-        
-        # 与离线预处理保持一致：长边 644（PaDT 默认缩放逻辑）
-        vlm_image_size = 644
-        images_per_sample = []
-        vlm_batch_images = []
-        for imgs in batch_images:
-            if isinstance(imgs, (list, tuple)):
-                resized_imgs = [img.resize((vlm_image_size, vlm_image_size)) if hasattr(img, 'resize') else img for img in imgs]
-                vlm_batch_images.append(resized_imgs)
-                images_per_sample.append(len(imgs))
-            else:
-                vlm_batch_images.append([imgs.resize((vlm_image_size, vlm_image_size)) if hasattr(imgs, 'resize') else imgs])
-                images_per_sample.append(1)
-        
-        for i_ex, example in enumerate(examples):
-            answers_data = example["answers"]
-            
-            # 从 answers 中提取对话
-            if "conversations" in answers_data and len(answers_data["conversations"]) > 0:
-                # 使用对话作为 prompt，同时加入图片占位（与 build_padtvl_inputs 对齐）
-                conversation = answers_data["conversations"][0]
-                imgs = vlm_batch_images[i_ex]  # 已 resize 的低分辨率图
-                if isinstance(imgs, (list, tuple)):
-                    content = [{"type": "image", "image": img} for img in imgs]
-                else:
-                    content = [{"type": "image", "image": imgs}]
-                content.append({"type": "text", "text": conversation["value"]})
-                prompt = [{"role": "user", "content": content}]
-                prompts.append(prompt)
-                
-                # 使用 answer_template 作为 completion（后续用 VRT 替换 <|Obj_x|>）
-                completion_raw = answers_data.get("answer_template", "")
-                
-                # 从 segmentation 数据中提取物体信息
-                objects_info = {}
-                if "seg" in example and len(example["seg"]) > 0:
-                    # 获取第一帧的 segmentation 数据
-                    seg_data = example["seg"][0]
-                    
-                    # 解析 segmentation 数据（如果是字符串需要解析）
-                    if isinstance(seg_data, str):
-                        seg_data = json.loads(seg_data)
-                    
-                    # 从 completion 中提取引用的物体编号
-                    pattern = r'<\|Obj_(\d+)\|>'
-                    obj_indices = re.findall(pattern, completion_raw)
-                    
-                    # 为每个引用的物体收集来自不同视角的信息
-                    for obj_idx in obj_indices:
-                        if obj_idx not in objects_info:
-                            obj_info_list = []
-                            
-                            # 检查每个视角的 segmentation 数据
-                            for seg_key, seg_value in seg_data.items():
-                                if isinstance(seg_value, str):
-                                    seg_value = json.loads(seg_value)
-                                
-                                # 如果该视角中有这个物体
-                                if obj_idx in seg_value:
-                                    obj_data = seg_value[obj_idx]
-                                    obj_info = {
-                                        'bbox': obj_data.get('bbox', []),
-                                        'patches': obj_data.get('patches', []),
-                                        'label': obj_data.get('label', ''),
-                                        'view': seg_key  # 标记来自哪个视角
-                                    }
-                                    if 'mask' in obj_data:
-                                        obj_info['rle'] = obj_data['mask']
-                                    obj_info_list.append(obj_info)
-                                    # 收集 patch id 用于与当前 grid 对齐的 sanity check
-                                    try:
-                                        patch_ids_all.extend([int(p) for p in obj_info['patches']])
-                                    except Exception:
-                                        pass
-                            
-                            # 如果找到了该物体的信息（可能来自1-2个视角）
-                            if obj_info_list:
-                                objects_info[obj_idx] = obj_info_list
-                
-                # 构建 solution 数据结构
-                # 将 <|Obj_x|> 替换为 VRT token（使用 patches 信息）
-                def _obj_to_vrt(match: re.Match) -> str:
-                    obj_idx = match.group(1)
-                    view_infos = objects_info.get(obj_idx, [])
-                    # 保留有 patch 的视角
-                    view_infos = [v for v in view_infos if v.get('patches')]
-                    if not view_infos:
-                        return match.group(0)
+                obj_['patches'] = selected_patches_global
+                obj_['picked'] = pick_patch
+                obj_['picked_local'] = pick_patch_local
+                obj_['picked_view_ids'] = selected_patch_view_ids[pick_idx]
+                new_objs.append(obj_)
+                completion_with_vrt += self.padt_vl_interface.processor.pid2vrt(pick_patch) + completion_part
 
-                    # 视角优先级：agent/third/ego -> wrist/hand -> 其他
-                    ordered: list[dict] = []
-                    def _append_by_substring(subs: list[str]):
-                        for sub in subs:
-                            for v in view_infos:
-                                if sub in v.get('view', '') and v not in ordered:
-                                    ordered.append(v)
-                    _append_by_substring(["agent", "third", "ego"])
-                    _append_by_substring(["wrist", "hand"])
-                    for v in view_infos:
-                        if v not in ordered:
-                            ordered.append(v)
+            solutions.append({
+                'text': solution.get('text', completion),
+                'objects': new_objs
+            })
+            completions.append(completion_with_vrt + self.padt_vl_interface.processor.tokenizer.eos_token)
 
-                    picked: list[int] = []
-                    sample_n = 3
-                    for v in ordered:
-                        patches = [int(p) for p in v.get('patches', []) or []]
-                        if not patches:
-                            continue
-                        if len(patches) < sample_n:
-                            picked.extend([random.choice(patches) for _ in range(sample_n)])
-                        else:
-                            picked.extend(random.sample(patches, sample_n))
-
-                    if not picked:
-                        return match.group(0)
-                    return processor.pid2vrt(picked)
-
-                # 暂存原始 completion 与 objects_info，稍后重映射 patches 后再做 VRT 替换
-                completion_raw_list.append(completion_raw)
-                objects_infos_list.append(objects_info)
-            else:
-                # 如果没有对话数据，跳过
-                return None
-        
-        # 使用 padt_vl_interface 的 tokenizer 处理
-        prompt_texts = [self.padt_vl_interface.processor.apply_chat_template(
-            prompt, tokenize=False, add_generation_prompt=True
-        ) for prompt in prompts]
-        
-        # 使用所有视角的图片（和 build_padtvl_inputs 一致，保留多视角信息）
-        from qwen_vl_utils import process_vision_info
-        
-        # prompts 已经包含 resize 后的图片信息，直接用于 process_vision_info
-        image_inputs, _ = process_vision_info(prompts)
-        
-        # Tokenize prompts with images
+        # tokenizing
         prompt_inputs = self.padt_vl_interface.processor(
-            text=prompt_texts,
-            images=image_inputs,
+            text=prompt_text,
+            images=batch_images,
             return_tensors='pt',
             padding=True,
             padding_side='left',
             add_special_tokens=False
         )
-
-        prompt_inputs = {k: v.to(self.padt_vl_interface.model.device) for k, v in prompt_inputs.items()}
-        prompt_ids = prompt_inputs["input_ids"]
-        prompt_mask = prompt_inputs["attention_mask"]
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+        batch_size = prompt_ids.size(0)
         prompt_length = prompt_ids.size(1)
+        multimodal_inputs = {
+            'image_grid_thw': prompt_inputs['image_grid_thw'],
+            'pixel_values': prompt_inputs['pixel_values']
+        }
+        # trainer_cfg = getattr(self.config, "trainer", None)
+        # use_sft_vp_mask = bool(getattr(trainer_cfg, "use_sft_vp_mask", False))
+        use_sft_vp_mask = True
+        model_embed_token_size = int(
+            getattr(self.padt_vl_interface.processor, "model_embed_token_size", get_input_embedding_vocab_size(model))
+        )
+        device = prompt_ids.device
+        images_per_sample = [
+            len(imgs) if isinstance(imgs, (list, tuple)) else 1
+            for imgs in batch_images
+        ]
         
-        # --- Patch remapping: align offline patches (computed at long-side 644, patch 28) to runtime grid ---
-        def _remap_patches(patches: list[int], off_h: int, off_w: int, rt_h: int, rt_w: int) -> list[int]:
-            if not patches or off_h <= 0 or off_w <= 0 or rt_h <= 0 or rt_w <= 0:
-                return patches
-            mapped: list[int] = []
-            for p in patches:
-                r_off = p // off_w
-                c_off = p % off_w
-                r_norm = (r_off + 0.5) / off_h
-                c_norm = (c_off + 0.5) / off_w
-                r_rt = int(torch.floor(torch.tensor(r_norm * rt_h)).item())
-                c_rt = int(torch.floor(torch.tensor(c_norm * rt_w)).item())
-                r_rt = max(0, min(rt_h - 1, r_rt))
-                c_rt = max(0, min(rt_w - 1, c_rt))
-                mapped.append(r_rt * rt_w + c_rt)
-            # 去重且保持稳定顺序
-            seen = set()
-            uniq = []
-            for m in mapped:
-                if m not in seen:
-                    seen.add(m)
-                    uniq.append(m)
-            return uniq
-
-        # 预计算每个 sample 的离线/在线网格尺寸（用每个样本的第一张图，假设多视角同分辨率）
-        grid_thw = prompt_inputs.get('image_grid_thw')
-        runtime_grid_hw = []  # [(rt_h, rt_w)] per sample
-        offline_grid_hw = []  # [(off_h, off_w)] per sample
-        if grid_thw is not None:
-            flat_orig_sizes = []
-            for imgs in batch_images:
-                if isinstance(imgs, (list, tuple)):
-                    flat_orig_sizes.extend([img.size for img in imgs])
-                else:
-                    flat_orig_sizes.append(imgs.size)
-            flat_idx = 0
-            for imgs in batch_images:
-                count = len(imgs) if isinstance(imgs, (list, tuple)) else 1
-                # runtime grid 用第一视角
-                if flat_idx < grid_thw.shape[0]:
-                    rt_h = int(grid_thw[flat_idx, 1].item())
-                    rt_w = int(grid_thw[flat_idx, 2].item())
-                else:
-                    rt_h = rt_w = 0
-                # offline grid 用第一视角原始尺寸
-                if flat_idx < len(flat_orig_sizes):
-                    ow, oh = flat_orig_sizes[flat_idx]
-                    scale = 644.0 / max(oh, ow)
-                    target_w = int(ow * scale)
-                    target_h = int(oh * scale)
-                    off_w = max(1, round(target_w / 28))
-                    off_h = max(1, round(target_h / 28))
-                else:
-                    off_h = off_w = 0
-                runtime_grid_hw.append((rt_h, rt_w))
-                offline_grid_hw.append((off_h, off_w))
-                flat_idx += count
-
-        # 按样本重映射 patches，并重新生成 completions（VRT token 与 runtime grid 对齐）
-        completions = []
-        solutions = []
-        if grid_thw is not None and runtime_grid_hw:
-            for sample_idx, (rt_hw, off_hw) in enumerate(zip(runtime_grid_hw, offline_grid_hw)):
-                if sample_idx >= len(objects_infos_list) or sample_idx >= len(completion_raw_list):
-                    break
-                rt_h, rt_w = rt_hw
-                off_h, off_w = off_hw
-                objects_info = objects_infos_list[sample_idx]
-                for obj_idx, obj_info_list in objects_info.items():
-                    for obj_info in obj_info_list:
-                        if 'patches' in obj_info:
-                            obj_info['patches'] = _remap_patches(obj_info['patches'], off_h, off_w, rt_h, rt_w)
-                completion_raw = completion_raw_list[sample_idx]
-
-                def _obj_to_vrt_runtime(match: re.Match) -> str:
-                    obj_idx = match.group(1)
-                    view_infos = objects_info.get(obj_idx, [])
-                    view_infos = [v for v in view_infos if v.get('patches')]
-                    if not view_infos:
-                        return match.group(0)
-                    ordered: list[dict] = []
-                    def _append_by_substring(subs: list[str]):
-                        for sub in subs:
-                            for v in view_infos:
-                                if sub in v.get('view', '') and v not in ordered:
-                                    ordered.append(v)
-                    _append_by_substring(["agent", "third", "ego"])
-                    _append_by_substring(["wrist", "hand"])
-                    for v in view_infos:
-                        if v not in ordered:
-                            ordered.append(v)
-                    picked: list[int] = []
-                    sample_n = 3
-                    for v in ordered:
-                        patches = [int(p) for p in v.get('patches', []) or []]
-                        if not patches:
-                            continue
-                        if len(patches) < sample_n:
-                            picked.extend([random.choice(patches) for _ in range(sample_n)])
-                        else:
-                            picked.extend(random.sample(patches, sample_n))
-                    if not picked:
-                        return match.group(0)
-                    return processor.pid2vrt(picked)
-
-                completion = re.sub(r'<\|Obj_(\d+)\|>', _obj_to_vrt_runtime, completion_raw)
-                completions.append(completion)
-                solutions.append({"text": completion, "objects": objects_info})
-        else:
-            # 回退：若无 grid 信息则直接使用原始 completion_raw（不推荐）
-            for completion_raw, objects_info in zip(completion_raw_list, objects_infos_list):
-                completions.append(completion_raw)
-                solutions.append({"text": completion_raw, "objects": objects_info})
-
-        # Tokenize completions（已对齐 runtime grid 的 VRT）
         completion_inputs = self.padt_vl_interface.processor(
             text=completions,
             return_tensors='pt',
@@ -420,76 +312,139 @@ class PaDT_PI(baseframework):
             padding_side='right',
             add_special_tokens=False
         )
-        completion_inputs = {k: v.to(self.padt_vl_interface.model.device) for k, v in completion_inputs.items()}
-        completion_ids = completion_inputs["input_ids"]
-        completion_mask = completion_inputs["attention_mask"]
+        completion_inputs = super()._prepare_inputs(completion_inputs)
+        completion_ids, completion_mask = completion_inputs["input_ids"], completion_inputs["attention_mask"]
+
+        # prepare for Robust Per-token Cross-Entropy Loss.
+        loss_masks = []
+        gt_bboxes = []
+        per_image_patch_nums = multimodal_inputs['image_grid_thw'].cumprod(-1)[:, -1] // (
+            self.padt_vl_interface.model.config.vision_config.spatial_merge_size ** 2
+        )
+        sample_patch_nums = []
+        img_ptr = 0
+        for n_imgs in images_per_sample:
+            sample_patch_nums.append(per_image_patch_nums[img_ptr:img_ptr + n_imgs].sum())
+            img_ptr += n_imgs
+        sample_patch_nums = torch.stack(sample_patch_nums)
+        sample_patch_offsets = torch.nn.functional.pad(sample_patch_nums.cumsum(-1), (1, 0), 'constant', 0)[:-1]
+        all_vision_patch_nums = int(sample_patch_nums.sum().item())
+
+        for sol, vpn in zip(solutions, sample_patch_offsets):
+            vpn_i = int(vpn.item())
+            for obj in sol['objects']:
+                this_object_loss_mask = torch.zeros((obj['picked'].shape[0], all_vision_patch_nums), device=device, dtype=torch.bool)
+                this_object_loss_mask[:, vpn_i + np.array(obj['patches'])] = True
+                this_object_loss_mask[np.arange(obj['picked'].shape[0]), vpn_i + obj['picked']] = False
+                loss_masks.append(this_object_loss_mask)
+                # obj['bbox']: x1, y1, x2, y2. Value in [0, 1].
+                gt_bboxes.append(obj['bbox'])
+
+        if len(loss_masks) == 0:
+            return None
+
+        loss_masks = torch.cat(loss_masks, dim=0)
+        loss_masks = torch.nn.functional.pad(loss_masks, (model_embed_token_size, 0), 'constant', False)
+        gt_bboxes = torch.Tensor(gt_bboxes).to(device).to(torch.bfloat16)
+        if len(gt_bboxes.shape) == 1:
+            gt_bboxes = gt_bboxes.unsqueeze(dim=-1).repeat_interleave(4, dim=-1)
 
         # Concatenate for full sequence
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
-        # 仅首次打印一次与 patches 对齐相关的关键信息，方便排查 VLM loss 是否错位
-        if not hasattr(self, "_logged_vlm_patch_debug") or not self._logged_vlm_patch_debug:
-            grid_info = grid_thw.detach().cpu().tolist() if grid_thw is not None else None
-            total_patches = None
-            if grid_thw is not None and grid_thw.numel() >= 3:
-                # grid_thw: [B, 3] -> t, h, w；实际视觉网格大小为 h*w
-                h = int(grid_thw[0, 1].item())
-                w = int(grid_thw[0, 2].item())
-                total_patches = h * w
-            min_patch = min(patch_ids_all) if patch_ids_all else None
-            max_patch = max(patch_ids_all) if patch_ids_all else None
-            logger.warning(
-                "[VLM loss debug] vlm_image_size=%s, image_grid_thw=%s, total_patches=%s, patch_id_min=%s, patch_id_max=%s, images_per_sample=%s, rt_hw_sample0=%s, off_hw_sample0=%s",
-                vlm_image_size,
-                grid_info,
-                total_patches,
-                min_patch,
-                max_patch,
-                images_per_sample,
-                runtime_grid_hw[0] if runtime_grid_hw else None,
-                offline_grid_hw[0] if offline_grid_hw else None,
-            )
-            self._logged_vlm_patch_debug = True
+        input_ids = self.padt_vl_interface.processor.assign_to_global_vrt_id(
+            input_ids,
+            multimodal_inputs['image_grid_thw'],
+            images_per_sample=images_per_sample,
+        )
 
-        # 重新映射 VRT token 到全局 ID（与 PaDT 训练对齐）
-        if prompt_inputs.get('image_grid_thw') is not None:
-            input_ids = processor.assign_to_global_vrt_id(input_ids, prompt_inputs['image_grid_thw'], images_per_sample=images_per_sample)
+        # Get the current policy's log probabilities
+        model_output = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **multimodal_inputs)
+
+        logits = model_output.logits[:, prompt_length-1:-1, :]  # (B, L, V)
+        input_ids = input_ids[:, prompt_length:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+        if use_sft_vp_mask:
+            visual_patch_mask = input_ids >= model_embed_token_size
+            logits[visual_patch_mask] = logits[visual_patch_mask].masked_fill(loss_masks, float('-inf'))
         
-        # Prepare multimodal inputs
-        multimodal_inputs = {
-            'image_grid_thw': prompt_inputs.get('image_grid_thw'),
-            'pixel_values': prompt_inputs.get('pixel_values')
-        }
+        # # decode to bbox
+        # hidden_states = torch.stack(model_output.hidden_states, dim=1)[:, -1:, prompt_length-1:-1].permute(2, 1, 0, 3).unsqueeze(dim=-2).contiguous() # [BS, Layers, N, Dim] -> [N, Layers, BS, 1, D]
+        # completions, feats, labels, vps, vps_feats = parseVRTintoCompletion(self.padt_vl_interface.processor, completion_ids, hidden_states, torch.tensor([False] * batch_size), model_output.past_image_embeds, multimodal_inputs['image_grid_thw']) # hidden_states: [N, Layers, BS, D]
+        # low_res_image_embeds = model_output.past_image_embeds
+        # high_res_image_embeds = model_output.past_high_res_image_embeds
+        # visual_pe = model_output.past_visual_pe
         
-        # Forward pass with gradients enabled for VLM
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            model_output = self.padt_vl_interface.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                **multimodal_inputs
-            )
-            logits = model_output.logits[:, prompt_length-1:-1, :]  # (B, L, V)
-        
-        # Compute token loss（在 no_grad 外计算，但 logits 已 detach，不回传 VLM 梯度）
-        target_ids = input_ids[:, prompt_length:]  # (B, L)
-        
-        # Calculate cross-entropy loss
-        logit_log_probs = F.log_softmax(logits, dim=-1)
-        token_log_prob = torch.gather(logit_log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+        # # warm up stage: using visual prototype rather than hidden features to feed into decoder.
+        # if self.state.epoch < (self.state.num_train_epochs / 4) and self.state.global_step < 300 and self.args.use_warm_up:
+        #     feats = vps_feats
+        # decoded_list = model(feats, low_res_image_embeds, high_res_image_embeds, multimodal_inputs['image_grid_thw'], visual_pe, is_main=False)
+        # del model_output
+
+        # if self.args.use_mask_loss:
+        #     gt_mask = torch.zeros_like(decoded_list['pred_mask'])
+        #     loss_mask = torch.zeros_like(decoded_list['pred_mask'])
+
+        #     obj_idx = 0
+        #     for sol in solutions:
+        #         for obj in sol['objects']:
+        #             if 'rle' in obj:
+        #                 gt_m = mask.decode(obj['rle'])
+        #                 mask_h, mask_w = decoded_list['pred_mask_valid_hw'][0][obj_idx].item(), decoded_list['pred_mask_valid_hw'][1][obj_idx].item()
+        #                 resized_gt_m = torch.from_numpy(cv2.resize(gt_m.astype(np.float32()), (mask_w * 4, mask_h * 4)) > 0.5).to(gt_mask.dtype).to(gt_mask.device)
+        #                 gt_mask[obj_idx, :mask_h * 4, :mask_w * 4] = resized_gt_m
+        #                 loss_mask[obj_idx, :mask_h * 4, :mask_w * 4] = 1.0
+        #             obj_idx += 1
+        #     mask_loss = self.dice_loss(decoded_list['pred_mask'], gt_mask, loss_mask) + self.sigmoid_focal_loss(decoded_list['pred_mask'], gt_mask, loss_mask)
+        #     self._metrics['mask_loss'].append(self.accelerator.gather_for_metrics(mask_loss).mean().item())
+        # else:
+        #     mask_loss = 0.
+
+        # token loss
+        logit_log_probs = logits.log_softmax(dim=-1)
+        token_log_prob = torch.gather(logit_log_probs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
         per_token_loss = -token_log_prob
+        sft_loss = ((per_token_loss * completion_mask).sum(dim=-1) / (completion_mask.sum(dim=-1) + 1e-4)).to(logits.dtype)
+        if hasattr(self, "_metrics") and isinstance(self._metrics, dict):
+            if hasattr(self, "accelerator") and self.accelerator is not None:
+                sft_loss_metric = self.accelerator.gather_for_metrics(sft_loss).mean().item()
+            else:
+                sft_loss_metric = sft_loss.detach().mean().item()
+            self._metrics.setdefault('sft_loss', []).append(sft_loss_metric)
         
-        # Average over valid tokens
-        vlm_loss = ((per_token_loss * completion_mask).sum(dim=-1) / (completion_mask.sum(dim=-1) + 1e-4)).mean()
-        
-        return vlm_loss
+        # if self.args.use_bbox_loss:
+        #     # bbox loss
+        #     pred_bboxes = decoded_list['pred_boxes']  # num_bbox, 4 [cx, cy, w, h]
+        #     # gt_bboxes # num_bbox, 4 [x1, y1, x2, y2]
+        #     num_bboxes = gt_bboxes.shape[0]
+        #     giou, iou = self.generalized_box_iou(self.box_cxcywh_to_xyxy(pred_bboxes), gt_bboxes)
+        #     giou = torch.diag(giou).to(pred_bboxes.dtype)
+        #     bbox_loss = 1. - giou.sum() / (num_bboxes + 1e-4)
+        #     bbox_loss += torch.nn.functional.l1_loss(pred_bboxes, self.box_xyxy_to_cxcywh(gt_bboxes), reduction='none').sum() / (num_bboxes + 1e-4)
+        #     self._metrics['bbox_loss'].append(self.accelerator.gather_for_metrics(bbox_loss).mean().item())
+        #     self._metrics['iou'].append(self.accelerator.gather_for_metrics(torch.diag(iou).sum() / (num_bboxes + 1e-4)).mean().item())
+        #     self._metrics['giou'].append(self.accelerator.gather_for_metrics(giou.sum() / (num_bboxes + 1e-4)).mean().item())
+        # else:
+        #     bbox_loss = 0.
+
+        # if self.args.use_bbox_loss and self.args.use_score_loss:
+        #     # score loss
+        #     pred_score = decoded_list['pred_score'].sigmoid() * 2. - 1.  # [-1, 1]
+        #     score_loss = torch.nn.functional.mse_loss(pred_score, giou.unsqueeze(1).detach(), reduction='sum') / (num_bboxes + 1e-4)
+        #     self._metrics['score_loss'].append(self.accelerator.gather_for_metrics(score_loss).mean().item())
+        # else:
+        #     score_loss = 0.
+
+        #loss = sft_loss.mean() + bbox_loss + score_loss + mask_loss
+        return sft_loss.mean()
+
 
     def forward(
         self,
         examples: List[dict] = None,
         compute_vlm_loss: bool = False,
         **kwargs,
-    ) -> Tuple:
+    ) -> dict:
         """
         Args:
             examples: List[dict], each dict requires:
@@ -505,6 +460,7 @@ class PaDT_PI(baseframework):
         """
         batch_images = [example["image"] for example in examples]
         instructions = [example.get("lang", example.get("language")) for example in examples]  # [B, str]
+
         # print(f"instruction: {instructions[0]}")
         actions = [example["action"] for example in examples]  # label [B， len, 7]
         
@@ -570,9 +526,19 @@ class PaDT_PI(baseframework):
             if state_repeated is not None:
                 del state_repeated
             torch.cuda.empty_cache()
-            
-            vlm_loss = self.compute_vlm_loss(examples, batch_images, instructions)
-            if vlm_loss is not None:
+            vlm_instructions = [
+                (ex.get("answers", {}).get("conversations", [{}])[0].get("value", "")
+                if ex.get("answers", {}).get("conversations")
+                else ex.get("lang", ex.get("language", "")))
+                for ex in examples
+            ]
+            padt_vlm_inputs = self.padt_vl_interface.build_padtvl_vlm_inputs(
+                images=batch_images,
+                vlm_instructions=vlm_instructions,
+            )
+            model = self.padt_vl_interface.model
+            vlm_loss = self.compute_vlm_loss(model, examples, batch_images, padt_vlm_inputs)
+            if vlm_loss is not None: 
                 output_dict["vlm_loss"] = vlm_loss
         
         return output_dict
