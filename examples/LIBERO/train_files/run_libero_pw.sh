@@ -4,8 +4,8 @@
 #SBATCH -A prj0000000267          # 项目号/Account
 #SBATCH -t 0-15                   # 运行时间：0-24 = 24小时
 #SBATCH -N 1                      # 1 个节点
-#SBATCH --ntasks-per-node=8       # 每节点 8 个任务
-#SBATCH --gres=gpu:8              # 申请 8 张 GPU
+#SBATCH --ntasks-per-node=2       # 每节点 8 个任务
+#SBATCH --gres=gpu:2              # 申请 8 张 GPU
 #SBATCH -o slurm_%x_%j.out        # 标准输出
 #SBATCH -e slurm_%x_%j.err        # 错误输出
 
@@ -68,14 +68,14 @@ export WANDB_MODE=offline
 ############################
 accelerate launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes 8 \
+  --num_processes 2 \
   starVLA/training/train_starvla.py \
   --config_yaml ${config_yaml} \
   --framework.name ${Framework_name} \
   --framework.qwenvl.base_vlm ${base_vlm} \
   --datasets.vla_data.data_root_dir ${libero_data_root} \
   --datasets.vla_data.data_mix ${data_mix} \
-  --datasets.vla_data.per_device_batch_size 18 \
+  --datasets.vla_data.per_device_batch_size 8 \
   --trainer.vla_data.video_backend torchvision_av \
   --trainer.freeze_modules ${freeze_module_list} \
   --trainer.max_train_steps 10 \

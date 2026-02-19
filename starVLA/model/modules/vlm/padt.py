@@ -336,6 +336,20 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 if visual_encoder is None:
                     raise AttributeError("PaDTForConditionalGeneration: cannot find visual encoder (self.visual / self.model.visual)")
 
+                if image_grid_thw is None:
+                    raise ValueError("pixel_values is provided but image_grid_thw is None")
+                if pixel_values.ndim >= 1 and image_grid_thw.ndim == 2 and image_grid_thw.shape[-1] == 3:
+                    # Fail fast with a clear error when processor-side patch flattening and grid metadata diverge.
+                    expected_tokens = int(image_grid_thw.cumprod(-1)[:, -1].sum().item())
+                    got_tokens = int(pixel_values.shape[0])
+                    if got_tokens != expected_tokens:
+                        raise ValueError(
+                            "Vision input mismatch before visual encoder: "
+                            f"pixel_values_tokens={got_tokens}, expected_from_grid={expected_tokens}, "
+                            f"grid_thw={image_grid_thw.tolist()}, "
+                            f"spatial_merge_size={getattr(self.config.vision_config, 'spatial_merge_size', 'NA')}"
+                        )
+
                 visual_dtype = getattr(visual_encoder, "dtype", None)
                 if visual_dtype is None:
                     visual_dtype = next(visual_encoder.parameters()).dtype

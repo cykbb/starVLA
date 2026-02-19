@@ -112,7 +112,7 @@ trainer:
     weight_decay: 1.0e-08
 
   # parameters to be determined
-  is_resume: true
+  is_resume: false
   resume_epoch: null
   resume_step: null
   enable_gradient_checkpointing: false

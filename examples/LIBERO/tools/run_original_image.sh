@@ -34,7 +34,7 @@ echo "=========================================="
 python examples/LIBERO/tools/extract_episode_images.py \
     playground/Datasets/LEROBOT_LIBERO_DATA/libero_10_no_noops_1.0.0_lerobot/data/chunk-000/episode_000000.parquet \
     --output_dir examples/LIBERO/tools/original_images \
-    --num_frames 5
+    --num_frames 200
 
 EXIT_CODE=$?
 echo "=========================================="

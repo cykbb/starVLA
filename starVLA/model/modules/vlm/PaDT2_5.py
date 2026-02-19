@@ -7,7 +7,7 @@ import transformers
 from typing import Optional, List
 import copy
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers import AutoProcessor
+from transformers import AutoProcessor, AutoConfig
 from typing import Dict, Optional, List
 from torch.nn.utils.rnn import pad_sequence
 from transformers import BatchFeature
@@ -94,17 +94,34 @@ class _PaDT_VL_Interface(nn.Module):
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen2.5-VL-3B-Instruct")
 
-        model = PaDTForConditionalGeneration.from_pretrained(
-            model_id,
-            attn_implementation="flash_attention_2",
-            torch_dtype="auto",
-        )
-
         # Force visual merge granularity for VRT/patch alignment (default: 1 => 14x14 @224).
         target_merge_size = int(qwenvl_config.get("spatial_merge_size", 1))
         if target_merge_size < 1:
             raise ValueError(f"Invalid spatial_merge_size={target_merge_size}, expected >= 1")
-        orig_merge_size = int(getattr(model.config.vision_config, "spatial_merge_size", 2))
+
+        # Build model with target merge-size from config-time to avoid runtime inconsistency
+        # between precomputed visual indexing buffers and updated merge attributes.
+        model_cfg = AutoConfig.from_pretrained(model_id)
+        orig_merge_size = int(getattr(model_cfg.vision_config, "spatial_merge_size", 2))
+        load_kwargs = dict(
+            attn_implementation="flash_attention_2",
+            torch_dtype="auto",
+        )
+        if target_merge_size != orig_merge_size:
+            model_cfg.vision_config.spatial_merge_size = target_merge_size
+            load_kwargs["config"] = model_cfg
+            load_kwargs["ignore_mismatched_sizes"] = True
+            logger.warning(
+                "Build model with overridden vision spatial_merge_size: %s -> %s (ignore_mismatched_sizes=True)",
+                orig_merge_size,
+                target_merge_size,
+            )
+
+        model = PaDTForConditionalGeneration.from_pretrained(
+            model_id,
+            **load_kwargs,
+        )
+
         model.config.vision_config.spatial_merge_size = target_merge_size
         updated_modules = 0
         for m in model.modules():
@@ -124,6 +141,27 @@ class _PaDT_VL_Interface(nn.Module):
 
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
+        # Keep processor-side vision tokenization in sync with model-side spatial merge.
+        image_processor = getattr(processor, "image_processor", None)
+        if image_processor is not None:
+            if hasattr(image_processor, "merge_size"):
+                old_proc_merge = int(getattr(image_processor, "merge_size"))
+                if old_proc_merge != target_merge_size:
+                    setattr(image_processor, "merge_size", target_merge_size)
+                    logger.warning(
+                        "Override processor image merge_size: %s -> %s",
+                        old_proc_merge,
+                        target_merge_size,
+                    )
+            if hasattr(image_processor, "spatial_merge_size"):
+                old_proc_spatial_merge = int(getattr(image_processor, "spatial_merge_size"))
+                if old_proc_spatial_merge != target_merge_size:
+                    setattr(image_processor, "spatial_merge_size", target_merge_size)
+                    logger.warning(
+                        "Override processor image spatial_merge_size: %s -> %s",
+                        old_proc_spatial_merge,
+                        target_merge_size,
+                    )
 
         # Wrap processor to support VRT tokens and pid2vrt helpers
         processor = VisonTextProcessingClass(
@@ -280,6 +318,24 @@ class _PaDT_VL_Interface(nn.Module):
         # Process vision and text
         image_inputs, video_inputs = process_vision_info(messages)
         batch_input = self.processor(text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
+        # Sanity check to avoid opaque CUDA index asserts when merge-size/tokenization mismatches.
+        if "input_ids" in batch_input and "image_grid_thw" in batch_input:
+            image_token_id = (
+                getattr(self.model.config, "image_token_id", None)
+                or getattr(getattr(self.model.config, "text_config", None), "image_token_id", None)
+            )
+            if image_token_id is not None:
+                n_image_tokens = int((batch_input["input_ids"] == image_token_id).sum().item())
+                n_image_features = int(
+                    (batch_input["image_grid_thw"].cumprod(-1)[:, -1] // (self.processor.spatial_merge_size ** 2)).sum().item()
+                )
+                if n_image_tokens != n_image_features:
+                    raise ValueError(
+                        "Image token/feature mismatch before model forward: "
+                        f"tokens={n_image_tokens}, features={n_image_features}, "
+                        f"processor_merge={self.processor.spatial_merge_size}, "
+                        f"grid_thw={batch_input['image_grid_thw'].tolist()}"
+                    )
         
 
         # # Handle labels for training

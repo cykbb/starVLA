@@ -118,7 +118,13 @@ class PaDT_PI(baseframework):
             tok_len = len(self.padt_vl_interface.processor.tokenizer)
             embed_len = get_input_embedding_vocab_size(self.padt_vl_interface.model)
             if tok_len > embed_len:
-                self.padt_vl_interface.model.resize_token_embeddings(tok_len, mean_resizing=False)
+                logger.info(
+                    "Tokenizer has %s extra VRT tokens above base embeddings (%s -> %s); "
+                    "skip resize_token_embeddings on purpose (VRT ids map to runtime image prototypes).",
+                    tok_len - embed_len,
+                    embed_len,
+                    tok_len,
+                )
             # Keep base embedding vocab size (not tokenizer length after adding VRT tokens).
             self.padt_vl_interface.processor.model_embed_token_size = embed_len
         except Exception as e:
@@ -460,7 +466,8 @@ class PaDT_PI(baseframework):
             padding_side='left',
             add_special_tokens=False
         )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        model_device = next(model.parameters()).device
+        prompt_inputs = prompt_inputs.to(model_device)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
         batch_size = prompt_ids.size(0)
         prompt_length = prompt_ids.size(1)
@@ -492,7 +499,7 @@ class PaDT_PI(baseframework):
             padding_side='right',
             add_special_tokens=False
         )
-        completion_inputs = super()._prepare_inputs(completion_inputs)
+        completion_inputs = completion_inputs.to(model_device)
         completion_ids, completion_mask = completion_inputs["input_ids"], completion_inputs["attention_mask"]
 
         # prepare for Robust Per-token Cross-Entropy Loss.
@@ -530,8 +537,8 @@ class PaDT_PI(baseframework):
                 self._vrt_log("no valid objects for VLM loss in this batch -> return None")
             return None
 
+        # Keep VP-only mask first; full-vocab padding will be aligned to runtime logits size later.
         loss_masks = torch.cat(loss_masks, dim=0)
-        loss_masks = torch.nn.functional.pad(loss_masks, (model_embed_token_size, 0), 'constant', False)
         gt_bboxes = torch.Tensor(gt_bboxes).to(device).to(torch.bfloat16)
         if len(gt_bboxes.shape) == 1:
             gt_bboxes = gt_bboxes.unsqueeze(dim=-1).repeat_interleave(4, dim=-1)
@@ -561,13 +568,28 @@ class PaDT_PI(baseframework):
 
         logits = model_output.logits[:, prompt_length-1:-1, :]  # (B, L, V)
         input_ids = input_ids[:, prompt_length:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+        logits_vocab_size = int(logits.shape[-1])
+        expected_vocab_size = int(model_embed_token_size + all_vision_patch_nums)
+        if logits_vocab_size != expected_vocab_size:
+            raise ValueError(
+                "VLM vocab alignment mismatch: "
+                f"logits_vocab_size={logits_vocab_size}, "
+                f"expected(model_embed_token_size + all_vision_patch_nums)={expected_vocab_size}, "
+                f"model_embed_token_size={model_embed_token_size}, "
+                f"all_vision_patch_nums={all_vision_patch_nums}, "
+                f"image_grid_thw={multimodal_inputs['image_grid_thw'].tolist()}, "
+                f"images_per_sample={images_per_sample}"
+            )
+
         if use_sft_vp_mask:
+            loss_masks = torch.nn.functional.pad(loss_masks, (model_embed_token_size, 0), 'constant', False)
             visual_patch_mask = input_ids >= model_embed_token_size
             logits[visual_patch_mask] = logits[visual_patch_mask].masked_fill(loss_masks, float('-inf'))
             if debug_this_step:
                 self._vrt_log(
                     f"use_sft_vp_mask visual_patch_tokens={int(visual_patch_mask.sum().item())} "
-                    f"loss_masks_shape={tuple(loss_masks.shape)} logits_shape={tuple(logits.shape)}"
+                    f"loss_masks_shape={tuple(loss_masks.shape)} logits_shape={tuple(logits.shape)} "
+                    f"model_embed_token_size={model_embed_token_size}"
                 )
         
         # # decode to bbox

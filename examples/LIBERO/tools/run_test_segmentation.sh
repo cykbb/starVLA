@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -J libero_sim
-#SBATCH -p testqueue
+#SBATCH -p h200n
 #SBATCH -A prj0000000267
 #SBATCH -t 00:30:00
 #SBATCH --gres=gpu:1          # 必须要有GPU
@@ -26,7 +26,7 @@ export PYTHONPATH="${LIBERO_HOME}:${PYTHONPATH:-}"
 
 python examples/LIBERO/tools/test_parquet_segmentation.py \
     --parquet_path playground/Datasets/LEROBOT_LIBERO_DATA/libero_10_no_noops_1.0.0_lerobot/data/chunk-000/episode_000000_with_seg.parquet \
-    --num_steps 3 \
+    --num_steps 200 \
     --output_prefix episode_10_000000
 
 echo ""

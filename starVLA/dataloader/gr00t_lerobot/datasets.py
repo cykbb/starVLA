@@ -469,7 +469,7 @@ class LeRobotSingleDataset(Dataset):
                         "data/chunk_index": episode["data/chunk_index"],
                         "data/file_index": episode["data/file_index"],
                         "data/file_from_index": index,
-                        "videos/observation.images.wrist/from_timestamp": episode["videos/observation.images.wrist/from_timestamp"],
+                        "videos/observation.images.wrist/from_timestamp": episode["videos/observation.images.wrist_image/from_timestamp"],
                     }
                     self.trajectory_ids_to_metadata[trajectory_ids[-1]] = episode_meta
 

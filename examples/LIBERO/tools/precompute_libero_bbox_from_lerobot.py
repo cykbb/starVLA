@@ -334,15 +334,19 @@ def process_trajectory(
         action_data = df.iloc[idx]
         
         # 构建7维动作 [x, y, z, rx, ry, rz, gripper]
-        action = np.array([
-            action_data.get("action.delta_eef_position.x", 0.0),
-            action_data.get("action.delta_eef_position.y", 0.0),
-            action_data.get("action.delta_eef_position.z", 0.0),
-            action_data.get("action.delta_eef_axis_angle.x", 0.0),
-            action_data.get("action.delta_eef_axis_angle.y", 0.0),
-            action_data.get("action.delta_eef_axis_angle.z", 0.0),
-            action_data.get("action.gripper_position", -1.0),
-        ], dtype=np.float32)
+        raw_action = action_data.get("action")
+        if isinstance(raw_action, (list, tuple, np.ndarray)) and len(raw_action) == 7:
+            action = np.array(raw_action, dtype=np.float32)
+        else:
+            action = np.array([
+                action_data.get("action.delta_eef_position.x", 0.0),
+                action_data.get("action.delta_eef_position.y", 0.0),
+                action_data.get("action.delta_eef_position.z", 0.0),
+                action_data.get("action.delta_eef_axis_angle.x", 0.0),
+                action_data.get("action.delta_eef_axis_angle.y", 0.0),
+                action_data.get("action.delta_eef_axis_angle.z", 0.0),
+                action_data.get("action.gripper_position", -1.0),
+            ], dtype=np.float32)
         
         # 执行动作
         obs, reward, done, info = env.step(action.tolist())

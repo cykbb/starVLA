@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -J libero_sim
-#SBATCH -p testqueue
+#SBATCH -p h200n
 #SBATCH -A prj0000000267
 #SBATCH -t 00:30:00
 #SBATCH --gres=gpu:1          # 必须要有GPU

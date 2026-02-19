@@ -7,6 +7,7 @@
 import json
 import os
 import sys
+import io
 from pathlib import Path
 
 import numpy as np
@@ -15,18 +16,89 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from pycocotools import mask as maskUtils
 import random
+from PIL import Image
 
 # 确保能找到相关模块
 SCRIPT_DIR = Path(__file__).parent
 OUTPUT_DIR = SCRIPT_DIR / "test_segmentation_output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+# 可能的图像列名（优先级从高到低）
+AGENTVIEW_IMG_COLUMNS = [
+    "observation.agentview_image",
+    "observation.agentview_rgb",
+    "agentview_image",
+    "agentview_rgb",
+]
+WRIST_IMG_COLUMNS = [
+    "observation.robot0_eye_in_hand_image",
+    "observation.robot0_eye_in_hand_rgb",
+    "wrist_image",
+    "wrist_rgb",
+]
+
+
+def _select_image_columns(df: pd.DataFrame) -> tuple[str | None, str | None]:
+    """从DataFrame中自动选择两路相机的图像列。"""
+    def pick(candidates, fallback_contains):
+        for name in candidates:
+            if name in df.columns:
+                return name
+        for col in df.columns:
+            if all(key in col for key in fallback_contains):
+                return col
+        return None
+
+    agent_col = pick(AGENTVIEW_IMG_COLUMNS, ["agentview", "image"])
+    wrist_col = pick(WRIST_IMG_COLUMNS, ["wrist", "image"])
+    if wrist_col is None:
+        wrist_col = pick([], ["eye_in_hand", "image"])
+    return agent_col, wrist_col
+
+
+def _cell_to_image(cell):
+    """尽量将单元格内容转换为 (H, W, 3) 的uint8 RGB图像。失败返回None。"""
+    if cell is None:
+        return None
+    try:
+        if isinstance(cell, str):
+            path = Path(cell)
+            if path.exists():
+                return np.array(Image.open(path).convert("RGB"))
+            # 若是JSON数组
+            try:
+                arr = np.array(json.loads(cell))
+            except Exception:
+                return None
+        elif isinstance(cell, (bytes, bytearray)):
+            try:
+                with io.BytesIO(cell) as f:
+                    return np.array(Image.open(f).convert("RGB"))
+            except Exception:
+                return None
+        else:
+            arr = np.array(cell)
+
+        if not isinstance(arr, np.ndarray):
+            return None
+
+        if arr.ndim == 3 and arr.shape[0] in (3, 4) and arr.shape[0] < arr.shape[-1]:
+            arr = np.transpose(arr, (1, 2, 0))
+
+        if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+            arr = arr[..., :3]
+            return arr.astype(np.uint8)
+    except Exception:
+        return None
+    return None
+
 
 def decode_and_visualize_step(
     step_idx: int,
     agentview_seg_json: str,
     wrist_seg_json: str,
-    output_prefix: str
+    output_prefix: str,
+    raw_images: dict | None = None,
 ):
     """
     解码并可视化单个步骤的segmentation信息 (适配 PaDT Grid)
@@ -37,6 +109,7 @@ def decode_and_visualize_step(
     
     agentview_data = json.loads(agentview_seg_json)
     wrist_data = json.loads(wrist_seg_json)
+    raw_images = raw_images or {}
     
     # 【核心配置】必须与生成脚本保持一致
     PADT_MAX_SIDE = 644
@@ -76,7 +149,23 @@ def decode_and_visualize_step(
         patches_canvas = np.zeros((h, w, 3), dtype=np.uint8)
         mask_canvas = np.zeros((h, w, 3), dtype=np.uint8)
         
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(24, 8))
+        has_raw = cam_name in raw_images and raw_images[cam_name] is not None
+        cols = 4 if has_raw else 3
+        fig, axes = plt.subplots(1, cols, figsize=(6 * cols, 8))
+        axes = np.atleast_1d(axes).flatten()
+        ax_idx = 0
+        if has_raw:
+            raw_img = raw_images[cam_name]
+            if raw_img.shape[-1] == 4:
+                raw_img = raw_img[..., :3]
+            axes[ax_idx].imshow(raw_img.astype(np.uint8))
+            axes[ax_idx].set_title("Raw", fontweight='bold')
+            axes[ax_idx].axis('off')
+            ax_idx += 1
+
+        ax1 = axes[ax_idx]; ax_idx += 1
+        ax2 = axes[ax_idx]; ax_idx += 1
+        ax3 = axes[ax_idx]
         
         for obj_id, info in objects.items():
             bbox_norm = info['bbox']
@@ -183,18 +272,37 @@ def test_parquet_segmentation(
         print(f"❌ 错误: 缺少 'segmentation.agentview_bbox_mask' 列")
         return
     
+    agent_img_col, wrist_img_col = _select_image_columns(df)
+    print("\n图像列自动检测:")
+    if agent_img_col:
+        print(f"  ✓ agentview 列: {agent_img_col}")
+    else:
+        print("  ⚠ 未找到 agentview 图像列，将跳过原图可视化")
+    if wrist_img_col:
+        print(f"  ✓ wrist 列: {wrist_img_col}")
+    else:
+        print("  ⚠ 未找到 wrist 图像列，将跳过原图可视化")
+
     test_steps = min(num_steps, len(df))
     print(f"\n开始测试前 {test_steps} 个步骤...")
     
     for step_idx in range(test_steps):
-        agentview_seg = df.iloc[step_idx]["segmentation.agentview_bbox_mask"]
-        wrist_seg = df.iloc[step_idx]["segmentation.wrist_bbox_mask"]
+        row = df.iloc[step_idx]
+        agentview_seg = row["segmentation.agentview_bbox_mask"]
+        wrist_seg = row["segmentation.wrist_bbox_mask"]
+
+        raw_images = {}
+        if agent_img_col:
+            raw_images["agentview"] = _cell_to_image(row.get(agent_img_col))
+        if wrist_img_col:
+            raw_images["wrist"] = _cell_to_image(row.get(wrist_img_col))
         
         decode_and_visualize_step(
             step_idx=step_idx,
             agentview_seg_json=agentview_seg,
             wrist_seg_json=wrist_seg,
-            output_prefix=output_prefix
+            output_prefix=output_prefix,
+            raw_images=raw_images,
         )
     
     print(f"\n{'#'*60}")
