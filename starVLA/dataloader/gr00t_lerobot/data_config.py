@@ -448,7 +448,6 @@ class Libero4in1DataConfig:
         "state.roll",
         "state.pitch",
         "state.yaw",
-        "state.pad",
         "state.gripper",
     ]
     action_keys = [
@@ -916,6 +915,8 @@ class AgilexDataConfig:
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig(),
+    "padt": Libero4in1DataConfig(),
+    "franka": Libero4in1DataConfig(),
     "oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig(),
     "oxe_rt1": OxeRT1DataConfig(),

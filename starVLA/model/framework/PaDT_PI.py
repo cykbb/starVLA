@@ -736,7 +736,6 @@ class PaDT_PI(baseframework):
             repeated_diffusion_steps = (
                 self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
             )
-            repeated_diffusion_steps = 2 # NO repeat for big action FM (use config value instead)
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             # 对每层特征做 repeat
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]
@@ -811,6 +810,8 @@ class PaDT_PI(baseframework):
         
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:
+            if isinstance(train_obs_image_size, int):
+                train_obs_image_size = (train_obs_image_size, train_obs_image_size)
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
     
         # Step 1: PaDT VL input format (use padt_vl_interface)

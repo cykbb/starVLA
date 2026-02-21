@@ -1,5 +1,5 @@
 run_id: padtpi_libero_vla_pw_only
-run_root_dir: /home/users/astar/i2r/lishijie/grasping_challenge/scratch/results/Checkpoints
+run_root_dir: /home/users/astar/i2r/chengzy/starVLA/results/Checkpoints
 seed: 42
 trackers: [jsonl, wandb]
 wandb_entity: bykkk-nanyang-technological-university-singapore
@@ -75,10 +75,10 @@ datasets:
 
 
 trainer:
-  debug_vrt: true
+  debug_vrt: false
   debug_vrt_max_steps: 20
   debug_vrt_token_preview: 12
-  debug_vrt_visualize: true
+  debug_vrt_visualize: false
   debug_vrt_visualize_max_samples: 2
   epochs: 100
   max_train_steps: 100000
@@ -95,8 +95,8 @@ trainer:
   # Freeze PaDT VLM vision encoder
   freeze_modules: 'padt_vl_interface.model.model.visual'
   loss_scale:
-    vlm: 0.5
-  compute_vlm_loss: true
+    vlm: 0.1
+  compute_vlm_loss: false
   detach_action_features: false   # action loss 不回传梯度到 VLM，避免梯度冲突
   max_grad_norm: 1.0
   warmup_ratio: 0.1

@@ -1,30 +1,31 @@
 #!/bin/bash
 #SBATCH -J padtpi_libero_pw
 #SBATCH -p testqueue              # 队列/partition
-#SBATCH -A prj0000000267          # 项目号/Account
-#SBATCH -t 0-15                   # 运行时间：0-24 = 24小时
+#SBATCH -A aicloud-testgroup          # 项目号/Account
+#SBATCH -t 0-18                   # 运行时间：0-24 = 24小时
 #SBATCH -N 1                      # 1 个节点
 #SBATCH --ntasks-per-node=2       # 每节点 8 个任务
+#SBATCH --cpus-per-task=1        # 每任务 14 个 CPU 核心 (避免 DataLoader 也就是 num_workers 阻塞)
 #SBATCH --gres=gpu:2              # 申请 8 张 GPU
 #SBATCH -o slurm_%x_%j.out        # 标准输出
 #SBATCH -e slurm_%x_%j.err        # 错误输出
 
 set -euo pipefail
+BASE_DIR="/home/users/astar/i2r/chengzy"
 
-############################
-# 加载环境（按图示例）
-############################
-# 完全清理所有模块，避免冲突
-module purge
-
+# ══════════════════════════════════════════════════════════
+#  环境初始化
+# ══════════════════════════════════════════════════════════
+export PS1="${PS1:-}"
+source ~/.bashrc
+# 初始化 conda 并在 SLURM 节点上激活环境
 module load miniforge/24.11.3-2
-module load cuda/12.4.1
-
-# 初始化 conda（必须在 SLURM 脚本中）
 eval "$(conda shell.bash hook)"
+conda activate "${BASE_DIR}/.conda/envs/starVLA"
 
-# 激活 conda 环境
-conda activate /scratch/prj0000000267/grasping_challenge/.conda/envs/starVLA
+# Load CUDA and set CUDA_HOME for deepspeed
+module load cuda/12.4.1 || module load cuda || true
+export CUDA_HOME="${CUDA_HOME:-/apps/cuda/12.4.1}"
 
 export NCCL_SOCKET_IFNAME=bond0
 export NCCL_IB_HCA=mlx5_2,mlx5_3
@@ -43,17 +44,17 @@ export OMP_NUM_THREADS=1
 ############################
 # 切换到项目根目录
 ############################
-cd /home/users/astar/i2r/lishijie/yk/starVLA || exit 1
+cd /home/users/astar/i2r/chengzy/starVLA || exit 1
 echo "Current directory: $(pwd)"
 
 Framework_name=PaDTPI
 freeze_module_list='padt_vl_interface.model.model.visual'
 base_vlm=playground/Pretrained_models/PaDT_Pro_3B
 config_yaml=./examples/LIBERO/train_files/starvla_libero_padt_pw_vla_only.yaml
-libero_data_root=playground/Datasets/LEROBOT_LIBERO_DATA
+libero_data_root=/home/users/astar/i2r/chengzy/any4lerobot/libero2lerobot/lerobot_output
 data_mix=libero_goal
-run_root_dir=/home/users/astar/i2r/lishijie/grasping_challenge/scratch/results/Checkpoints
-run_id=padtpi_libero_pw_with_grads_goal
+run_root_dir=/home/users/astar/i2r/chengzy/starVLA/results/Checkpoints
+run_id=padtpi_libero_pw_goal_2gpu_no_vlm_loss
 
 
 
@@ -75,14 +76,13 @@ accelerate launch \
   --framework.qwenvl.base_vlm ${base_vlm} \
   --datasets.vla_data.data_root_dir ${libero_data_root} \
   --datasets.vla_data.data_mix ${data_mix} \
-  --datasets.vla_data.per_device_batch_size 8 \
+  --datasets.vla_data.per_device_batch_size 4 \
   --trainer.vla_data.video_backend torchvision_av \
   --trainer.freeze_modules ${freeze_module_list} \
-  --trainer.max_train_steps 10 \
-  --trainer.save_interval 5000 \
-  --trainer.logging_frequency 1 \
-  --trainer.debug_vrt_max_steps 10 \
-  --trainer.eval_interval 1000 \
+  --trainer.max_train_steps 21000 \
+  --trainer.save_interval 3000 \
+  --trainer.logging_frequency 100 \
+  --trainer.eval_interval 300 \
   --run_root_dir ${run_root_dir} \
   --run_id ${run_id} \
   --wandb_entity bykkk-nanyang-technological-university-singapore \

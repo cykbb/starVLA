@@ -439,9 +439,9 @@ class VLATrainer(TrainerUtils):
             actions = np.array(actions)  # convert actions to numpy.ndarray
             # B, Chunk, dim = actions.shape
             num_pots = np.prod(actions.shape)
-            # Compute the metric score
+            # Compute the metric score (RMSE: L2_norm / sqrt(total_elements))
             score = TrainerUtils.euclidean_distance(normalized_actions, actions)
-            average_score = score / num_pots
+            average_score = score / np.sqrt(num_pots)
             step_metrics["mse_score"] = average_score
 
         del examples

@@ -152,9 +152,6 @@ class LeRobotSingleDataset(Dataset):
         self.data_cfg = data_cfg
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
-        # indict letobot version
-        self._lerobot_version =  self.data_cfg.get("lerobot_version", "v2.0") #self._indict_lerobot_version(**kwargs)
-
         self.delete_pause_frame = delete_pause_frame
 
         self.modality_configs = modality_configs
@@ -171,13 +168,25 @@ class LeRobotSingleDataset(Dataset):
         else:
             self.tag = embodiment_tag
 
-        self._metadata = self._get_metadata(EmbodimentTag(self.tag))
-
+        # indict letobot version
+        info_path = self._dataset_path / "meta/info.json"
+        
+        default_version = self.data_cfg.get("lerobot_version", "v2.0") if self.data_cfg else "v2.0"
+        
+        if info_path.exists():
+            with open(info_path, "r") as f:
+                info_data = json.load(f)
+            self._lerobot_version = info_data.get("codebase_version", default_version)
+        else:
+            self._lerobot_version = default_version
+        
         # LeRobot-specific config
         self._lerobot_modality_meta = self._get_lerobot_modality_meta()
         self._lerobot_info_meta = self._get_lerobot_info_meta()
         self._data_path_pattern = self._get_data_path_pattern()
         self._video_path_pattern = self._get_video_path_pattern()
+
+        self._metadata = self._get_metadata(EmbodimentTag(self.tag))
         self._chunk_size = self._get_chunk_size()
         self._tasks = self._get_tasks()
         self._answers = self._get_answers()  # Load conversation-based annotations
@@ -302,14 +311,9 @@ class LeRobotSingleDataset(Dataset):
         """
 
         # 1. Modality metadata
-        modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
         # 1.1. State and action modalities
         simplified_modality_meta: dict[str, dict] = {}
-        with open(modality_meta_path, "r") as f:
-            le_modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
+        le_modality_meta = self.lerobot_modality_meta
         for modality in ["state", "action"]:
             simplified_modality_meta[modality] = {}
             le_state_action_meta: dict[str, LeRobotStateActionMetadata] = getattr(
@@ -469,7 +473,7 @@ class LeRobotSingleDataset(Dataset):
                         "data/chunk_index": episode["data/chunk_index"],
                         "data/file_index": episode["data/file_index"],
                         "data/file_from_index": index,
-                        "videos/observation.images.wrist/from_timestamp": episode["videos/observation.images.wrist_image/from_timestamp"],
+                        "videos/observation.images.wrist_image/from_timestamp": episode["videos/observation.images.wrist_image/from_timestamp"],
                     }
                     self.trajectory_ids_to_metadata[trajectory_ids[-1]] = episode_meta
 
@@ -711,12 +715,83 @@ class LeRobotSingleDataset(Dataset):
     def _get_lerobot_modality_meta(self) -> LeRobotModalityMetadata:
         """Get the metadata for the LeRobot dataset."""
         modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
-        with open(modality_meta_path, "r") as f:
-            modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
-        return modality_meta
+        if modality_meta_path.exists():
+            with open(modality_meta_path, "r") as f:
+                return LeRobotModalityMetadata.model_validate(json.load(f))
+                
+        info_path = self.dataset_path / LE_ROBOT_INFO_FILENAME
+        if info_path.exists():
+            with open(info_path, "r") as f:
+                info_data = json.load(f)
+            
+            features = info_data.get("features", {})
+            state_meta = {}
+            action_meta = {}
+            video_meta = {}
+            annotation_meta = {}
+            
+            for key, feat in features.items():
+                if "video" in feat.get("dtype", ""):
+                    # Strip standard prefix to align with modality_config
+                    mapped_key = key.replace("observation.images.", "")
+                    # "image" in le robot's default structure maps to "primary_image" for VLM
+                    if mapped_key == "image":
+                        mapped_key = "primary_image"
+                    video_meta[mapped_key] = {"original_key": key}
+                elif key.startswith("observation.state") or key.startswith("action"):
+                    target_meta = state_meta if key.startswith("observation.state") else action_meta
+                    
+                    shape = feat.get("shape", [1])
+                    names = feat.get("names")
+                    
+                    if isinstance(names, dict) and "motors" in names:
+                        motor_names = names["motors"]
+                        # Map axis_angle to roll, pitch, yaw to match typical downstream VLA schemas
+                        mapped_motor_names = []
+                        for name in motor_names:
+                            if name == "axis_angle1":
+                                mapped_motor_names.append("roll")
+                            elif name == "axis_angle2":
+                                mapped_motor_names.append("pitch")
+                            elif name == "axis_angle3":
+                                mapped_motor_names.append("yaw")
+                            else:
+                                mapped_motor_names.append(name)
+                        
+                        # Some lists contain duplicate names like "gripper", "gripper". 
+                        # We merge adjacent identical names into a single feature mapping 
+                        # with start/end indices.
+                        current_idx = 0
+                        while current_idx < len(mapped_motor_names):
+                            motor_name = mapped_motor_names[current_idx]
+                            start_idx = current_idx
+                            while current_idx < len(mapped_motor_names) and mapped_motor_names[current_idx] == motor_name:
+                                current_idx += 1
+                            end_idx = current_idx
+                            
+                            target_meta[motor_name] = {
+                                "start": start_idx, "end": end_idx, "absolute": False, 
+                                "rotation_type": "axis_angle", "dtype": feat.get("dtype", "float32"),
+                                "original_key": key
+                            }
+                    else:
+                        target_meta[key.split('.')[-1]] = {
+                            "start": 0, "end": shape[0], "absolute": False, 
+                            "rotation_type": "axis_angle", "dtype": feat.get("dtype", "float32"),
+                            "original_key": key
+                        }
+                    
+                elif key.startswith("annotation"):
+                    annotation_meta[key.split('.')[-1]] = {"original_key": key}
+                    
+            return LeRobotModalityMetadata.model_validate({
+                "state": state_meta,
+                "action": action_meta,
+                "video": video_meta,
+                "annotation": annotation_meta if annotation_meta else None
+            })
+            
+        raise FileNotFoundError(f"Neither {LE_ROBOT_MODALITY_FILENAME} nor {LE_ROBOT_INFO_FILENAME} found in {self.dataset_path}")
 
     def _get_lerobot_info_meta(self) -> dict:
         """Get the metadata for the LeRobot dataset."""
@@ -793,6 +868,15 @@ class LeRobotSingleDataset(Dataset):
                 # segmentation.* 不在 lerobot modality metadata 中，直接跳过校验
                 if key.startswith("segmentation."):
                     continue
+                # annotation.* keys may not be in LeRobot modality metadata (e.g. v3 datasets
+                # that source language from tasks.parquet instead of annotation columns).
+                # Silently skip rather than raise.
+                if key.startswith("annotation."):
+                    try:
+                        self.lerobot_modality_meta.get_key_meta(key)
+                    except Exception:
+                        continue  # not an error: language comes from tasks lookup
+                    continue
                 # Check if the key is valid
                 try:
                     self.lerobot_modality_meta.get_key_meta(key)
@@ -814,51 +898,70 @@ class LeRobotSingleDataset(Dataset):
         self.epoch = epoch
 
     @staticmethod
-    def _project_patch_indices_23_to_16(patches) -> list[int]:
-        """Project flattened patch indices from a 23x23 grid to a 16x16 grid."""
-        if patches is None:
+    def mask_to_patches(
+        rle_mask: dict,
+        image_size: int = 224,
+        patch_size: int = 14,
+    ) -> list[int]:
+        """从 RLE mask 实时计算 patch indices（对应 VLM 的 patch grid）。
+
+        image_size=224, patch_size=14 → 16×16 grid（共 256 个 patches）。
+
+        Args:
+            rle_mask: COCO RLE dict：{"size": [H, W], "counts": str}
+            image_size: 图像 resize 后边长（默认 224）
+            patch_size: VLM 每个 patch 的像素大小（默认 14）
+        Returns:
+            list[int]：被 mask 覆盖到的 patch 线性索引，如 [0, 1, 17, ...]
+        """
+        import warnings
+        try:
+            from pycocotools import mask as maskUtils
+        except ImportError:
+            warnings.warn("pycocotools not installed. Please install it (pip install pycocotools) to enable VRT mask-to-patch conversion.", UserWarning)
             return []
-        if not isinstance(patches, (list, tuple, np.ndarray)):
-            return []
 
-        src_h = src_w = 23
-        dst_h = dst_w = 16
-        mapped = []
-        for p in patches:
-            try:
-                p = int(p)
-            except (TypeError, ValueError):
-                continue
-            if p < 0 or p >= src_h * src_w:
-                continue
+        n_patches = image_size // patch_size  # 16
 
-            src_r = p // src_w
-            src_c = p % src_w
+        # 1. Decode RLE → (H, W) bool array
+        # Make sure counts is bytes, which pycocotools requires
+        rle = {"size": rle_mask["size"], "counts": rle_mask["counts"]}
+        if isinstance(rle["counts"], str):
+            rle["counts"] = rle["counts"].encode("utf-8")
+            
+        binary_mask = maskUtils.decode(rle).astype(bool)  # (256, 256)
 
-            # Center-based projection from source grid cell to destination grid cell.
-            r_norm = (src_r + 0.5) / src_h
-            c_norm = (src_c + 0.5) / src_w
-            dst_r = min(dst_h - 1, max(0, int(r_norm * dst_h)))
-            dst_c = min(dst_w - 1, max(0, int(c_norm * dst_w)))
-            mapped.append(dst_r * dst_w + dst_c)
+        # 2. Nearest-neighbor resize to image_size×image_size
+        h, w = binary_mask.shape
+        row_idx = (np.arange(image_size) * h / image_size).astype(int)
+        col_idx = (np.arange(image_size) * w / image_size).astype(int)
+        resized = binary_mask[np.ix_(row_idx, col_idx)]  # (224, 224)
 
-        seen = set()
-        unique_mapped = []
-        for m in mapped:
-            if m not in seen:
-                seen.add(m)
-                unique_mapped.append(m)
-        return unique_mapped
+        # 3. Check each 14×14 patch region
+        patches = []
+        for pr in range(n_patches):
+            for pc in range(n_patches):
+                region = resized[
+                    pr * patch_size : (pr + 1) * patch_size,
+                    pc * patch_size : (pc + 1) * patch_size,
+                ]
+                if region.any():
+                    patches.append(pr * n_patches + pc)
+        return patches
 
-    def _project_segmentation_patches_23_to_16(self, seg_item):
-        """Project every object's `patches` field in segmentation dict from 23x23 to 16x16."""
+    def _enrich_seg_with_patches(self, seg_item: dict) -> dict:
+        """对 seg dict 内每个物体，从 mask 在线计算并注入 patches 字段。
+
+        最终每个物体包含：bbox, mask, label, patches（并列）。
+        """
         if not isinstance(seg_item, dict):
             return seg_item
-        for _, obj_data in seg_item.items():
-            if not isinstance(obj_data, dict):
+        for uid, obj in seg_item.items():
+            if not isinstance(obj, dict):
                 continue
-            if "patches" in obj_data:
-                obj_data["patches"] = self._project_patch_indices_23_to_16(obj_data["patches"])
+            mask_info = obj.get("mask")
+            if mask_info and "counts" in mask_info:
+                obj["patches"] = self.mask_to_patches(mask_info)
         return seg_item
 
     def __len__(self) -> int:
@@ -914,7 +1017,8 @@ class LeRobotSingleDataset(Dataset):
                     view_name = k.replace("segmentation.", "")
                     seg_item = seg_list[idx]
                     view_dict[view_name] = json.loads(seg_item) if isinstance(seg_item, str) else seg_item
-                    view_dict[view_name] = self._project_segmentation_patches_23_to_16(view_dict[view_name])
+                    # 在线计算 patches（从 RLE mask → 16×16 patch grid）
+                    view_dict[view_name] = self._enrich_seg_with_patches(view_dict[view_name])
                 result["seg"] = [view_dict]
         
         # Add answers data if available
@@ -998,29 +1102,33 @@ class LeRobotSingleDataset(Dataset):
     
     def get_trajectory_data_lerobot_v3(self, trajectory_id: int) -> pd.DataFrame:
         """Get the data for a trajectory from lerobot v3."""
+        # cache hit
         if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
             return self.curr_traj_data
-        else: #TODO check detail later
-            chunk_index = self.get_episode_chunk(trajectory_id)
 
-            file_index = self.get_episode_file_index(trajectory_id)
-            # file_from_index = self.get_episode_file_from_index(trajectory_id)
-            
-            
-            parquet_path = self.dataset_path / self.data_path_pattern.format(
-                chunk_index=chunk_index, file_index=file_index
-            )
-            assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-            file_data = pd.read_parquet(parquet_path)
-            
-            # filter by trajectory_id
-            episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
-            
-            # fix timestamp from epis index to file index
-            from_timestamp = self.trajectory_ids_to_metadata[trajectory_id]["videos/observation.images.wrist/from_timestamp"]
-            episode_data["timestamp"] = episode_data["timestamp"] + from_timestamp  
-            
-            return episode_data
+        episode_meta = self.trajectory_ids_to_metadata[trajectory_id]
+        # 从 episode metadata 读取 chunk_index 和 file_index，而非计算（兼容多任务合并后的数据）
+        chunk_index = episode_meta["data/chunk_index"]
+        file_index = episode_meta["data/file_index"]
+
+        parquet_path = self.dataset_path / self.data_path_pattern.format(
+            chunk_index=chunk_index, file_index=file_index
+        )
+        assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
+        file_data = pd.read_parquet(parquet_path)
+
+        # filter by trajectory_id
+        episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
+
+        # fix timestamp from episode-local index to video-file absolute timestamp
+        from_timestamp = episode_meta["videos/observation.images.wrist_image/from_timestamp"]
+        episode_data["timestamp"] = episode_data["timestamp"] + from_timestamp
+
+        # ✅ 写回缓存，避免重复读 parquet
+        self.curr_traj_id = trajectory_id
+        self.curr_traj_data = episode_data
+
+        return episode_data
 
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
@@ -1249,23 +1357,44 @@ class LeRobotSingleDataset(Dataset):
         step_indices = np.maximum(step_indices, 0)
         step_indices = np.minimum(step_indices, max_length - 1)
         # Get the annotations
-        task_indices: list[int] = []
+        # For LeRobot v3 datasets, annotation metadata may not exist because language
+        # comes from tasks.parquet via task_index, not from an annotation column.
         assert key.startswith(
             "annotation."
         ), f"Language key must start with 'annotation.', got {key}"
         subkey = key.replace("annotation.", "")
         annotation_meta = self.lerobot_modality_meta.annotation
-        assert annotation_meta is not None, f"Annotation metadata is None for {subkey}"
-        assert (
-            subkey in annotation_meta
-        ), f"Annotation key {subkey} not found in metadata, available annotation keys: {annotation_meta.keys()}"
+
+        # ---- v3 fallback: no annotation column → use task_index ----
+        if annotation_meta is None or subkey not in annotation_meta:
+            # Read the task_index for each step from the data parquet
+            result_texts: list[str] = []
+            for i in range(len(step_indices)):
+                idx = step_indices[i]
+                if "task_index" in self.curr_traj_data.columns:
+                    task_idx = self.curr_traj_data["task_index"].iloc[idx]
+                    task_idx = int(task_idx)
+                else:
+                    task_idx = 0
+                try:
+                    # 'task_index' is a column with integer IDs, and the actual string
+                    # descriptions are explicitly stored in the 'task' column by _get_tasks()
+                    matches = self.tasks[self.tasks["task_index"] == task_idx]
+                    desc = matches["task"].iloc[0] if not matches.empty else ""
+                except Exception:
+                    desc = ""
+                # Always return plain Python str, not numpy.str_
+                result_texts.append(str(desc))
+            return result_texts
+
+        # ---- v2.0 path: use annotation column ----
+        task_indices: list[int] = []
         subkey_meta = annotation_meta[subkey]
         original_key = subkey_meta.original_key
         if original_key is None:
             original_key = key
-        for i in range(len(step_indices)): # 
-            # task_indices.append(self.curr_traj_data[original_key][step_indices[i]].item())
-            value = self.curr_traj_data[original_key].iloc[step_indices[i]] # TODO check v2.0 
+        for i in range(len(step_indices)):
+            value = self.curr_traj_data[original_key].iloc[step_indices[i]]
             task_indices.append(value if isinstance(value, (int, float)) else value.item())
 
         return self.tasks.loc[task_indices]["task"].tolist()
@@ -1859,8 +1988,20 @@ class LeRobotMixtureDataset(Dataset):
                         wrist_views.append(image)
                 all_images = prim_images + wrist_views
                 
-                # Get language and action data
-                language = data[dataset.modality_keys["language"][0]][0]
+                # Get language data — must fall back to task description from tasks.parquet
+                # when language modality keys are empty (e.g. LeRobot v3 datasets without
+                # annotation columns but with a task_index column).
+                lang_keys = dataset.modality_keys.get("language", [])
+                if lang_keys:
+                    language = data[lang_keys[0]][0]
+                else:
+                    # Fall back: use the task description from the tasks table
+                    task_idx = int(data.get("task_index", [[0]])[0][0]) if "task_index" in data else 0
+                    try:
+                        matches = dataset.tasks[dataset.tasks["task_index"] == task_idx]
+                        language = str(matches["task"].iloc[0]) if not matches.empty else ""
+                    except Exception:
+                        language = ""
                 action = []
                 for action_key in dataset.modality_keys["action"]:
                     action.append(data[action_key])
@@ -1881,24 +2022,32 @@ class LeRobotMixtureDataset(Dataset):
                                 view_name = k.replace("segmentation.", "")
                                 seg_item = seg_list[idx]
                                 view_dict[view_name] = json.loads(seg_item) if isinstance(seg_item, str) else seg_item
-                                view_dict[view_name] = dataset._project_segmentation_patches_23_to_16(view_dict[view_name])
+                                view_dict[view_name] = dataset._enrich_seg_with_patches(view_dict[view_name])
                             result["seg"] = [view_dict]
                 
                 # Add answers data if configured
                 if self.data_cfg is not None and self.data_cfg.get("include_answers", False) not in ["False", False]:
                     if not dataset.answers.empty and dataset.curr_traj_data is not None:
-                        # Get task_index from current trajectory data
-                        language_key = dataset.modality_keys["language"][0].replace("annotation.", "")
+                        # Get task_index from current trajectory data.
+                        # For LeRobot v3 datasets there is no annotation column;
+                        # use task_index column directly.
+                        lang_keys_local = dataset.modality_keys.get("language", [])
                         annotation_meta = dataset.lerobot_modality_meta.annotation
-                        if annotation_meta and language_key in annotation_meta:
-                            original_key = annotation_meta[language_key].original_key or dataset.modality_keys["language"][0]
-                            if original_key in dataset.curr_traj_data.columns:
-                                task_index_value = dataset.curr_traj_data[original_key].iloc[step]
-                                task_index = int(task_index_value) if isinstance(task_index_value, (int, float)) else int(task_index_value.item())
-                                
-                                # Get answer data for this task_index
-                                if task_index in dataset.answers.index:
-                                    result["answers"] = dataset.answers.loc[task_index].to_dict()
+                        task_index = None
+                        if lang_keys_local and annotation_meta:
+                            language_key = lang_keys_local[0].replace("annotation.", "")
+                            if language_key in annotation_meta:
+                                original_key = annotation_meta[language_key].original_key or lang_keys_local[0]
+                                if original_key in dataset.curr_traj_data.columns:
+                                    task_index_value = dataset.curr_traj_data[original_key].iloc[step]
+                                    task_index = int(task_index_value) if isinstance(task_index_value, (int, float)) else int(task_index_value.item())
+                        if task_index is None and "task_index" in dataset.curr_traj_data.columns:
+                            # v3 fallback: read task_index directly
+                            task_index_value = dataset.curr_traj_data["task_index"].iloc[step]
+                            task_index = int(task_index_value) if isinstance(task_index_value, (int, float)) else int(task_index_value.item())
+                        # Get answer data for this task_index
+                        if task_index is not None and task_index in dataset.answers.index:
+                            result["answers"] = dataset.answers.loc[task_index].to_dict()
                 
                 # Add state data if configured
                 if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
