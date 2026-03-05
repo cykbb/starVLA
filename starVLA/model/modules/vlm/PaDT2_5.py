@@ -314,6 +314,7 @@ class _PaDT_VL_Interface(nn.Module):
 
         # Prepare text prompts
         texts = [self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in messages]
+        #print("texts", texts)
 
         # Process vision and text
         image_inputs, video_inputs = process_vision_info(messages)

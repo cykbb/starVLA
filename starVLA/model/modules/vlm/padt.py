@@ -583,7 +583,8 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 
         generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
         self._validate_model_kwargs(model_kwargs.copy())
-        self._validate_assistant(assistant_model, tokenizer, assistant_tokenizer)
+        if hasattr(self, "_validate_assistant"):
+            self._validate_assistant(assistant_model, tokenizer, assistant_tokenizer)
 
         # 2. Set generation parameters if not already defined
         if synced_gpus is None:
@@ -694,9 +695,6 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         self._prepare_cache_for_generation(
             generation_config, model_kwargs, assistant_model, batch_size, max_cache_length, device
         )
-
-        # 8. determine generation mode
-        generation_mode = generation_config.get_generation_mode(assistant_model)
 
         if streamer is not None and (generation_config.num_beams > 1):
             raise ValueError(

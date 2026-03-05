@@ -34,6 +34,111 @@ from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import get_action_model, LayerwiseFlowmatchingActionHead
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
+from transformers import LogitsProcessor
+
+
+class VRTViewConstraintProcessor(LogitsProcessor):
+    """约束：连续两个 VRT token 不得来自同一视角。
+
+    训练 GT 中，同一物体的 VRT token 格式为 <|VRT_agentview_k|><|VRT_wrist_k|>，
+    不同视角的 token 紧邻排列，中间无其他 VRT token。
+    因此只需约束：上一个 token 是视角 X 的 VRT → 下一个 VRT 不能再来自视角 X。
+
+    Args:
+        tokenizer: HuggingFace tokenizer（需已注册 <|VRT_N|> 特殊 token）
+        num_agentview_patches: 主视角 patch 总数（如 16×16=256）
+        num_wrist_patches: 手腕视角 patch 总数（如 16×16=256）
+    """
+
+    def __init__(self, tokenizer, num_agentview_patches: int, num_wrist_patches: int):
+        vrt_base = tokenizer.convert_tokens_to_ids("<|VRT_0|>")
+        self._av_start = vrt_base
+        self._av_end = vrt_base + num_agentview_patches          # exclusive
+        self._wrist_end = vrt_base + num_agentview_patches + num_wrist_patches  # exclusive
+        # 预构建 tensor，__call__ 时 to(device) 即可
+        self._av_ids = torch.arange(self._av_start, self._av_end)
+        self._wrist_ids = torch.arange(self._av_end, self._wrist_end)
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        for b in range(input_ids.shape[0]):
+            last = input_ids[b, -1].item()
+            if self._av_start <= last < self._av_end:
+                # 上一个是主视角 VRT → mask 主视角，强制下一个 VRT 来自手腕视角（或非 VRT）
+                scores[b, self._av_ids.to(scores.device)] = float('-inf')
+            elif self._av_end <= last < self._wrist_end:
+                # 上一个是手腕视角 VRT → mask 手腕视角，强制下一个 VRT 来自主视角（或非 VRT）
+                scores[b, self._wrist_ids.to(scores.device)] = float('-inf')
+        return scores
+
+
+class PerViewCountConstraintProcessor(LogitsProcessor):
+    """每视角独立计数约束 + committed-view 强制续生成。
+
+    规则：
+    - 一旦某视角生成了第 1 个 VRT token（committed），该视角必须满 n_pick 个才能结束块。
+    - 两视角均满（或均未 committed）时允许生成非 VRT token（结束块）。
+    - 任意视角达到 n_pick 后，禁止该视角继续生成 VRT token（上限）。
+    - 遇到非 VRT token 时重置所有状态（跨物体边界）。
+
+    支持物体只出现在一个视角的情况：仅 committed 的视角会被强制续生成至 n_pick，
+    未 committed 的视角不受约束，模型自行决定是否加入。
+    """
+
+    def __init__(self, tokenizer, num_agentview_patches: int, num_wrist_patches: int, n_pick: int = 3):
+        vrt_base = tokenizer.convert_tokens_to_ids("<|VRT_0|>")
+        self._av_start  = vrt_base
+        self._av_end    = vrt_base + num_agentview_patches
+        self._wrist_end = vrt_base + num_agentview_patches + num_wrist_patches
+        self._n = n_pick
+        self._c0: dict = {}            # agentview count per batch item
+        self._c1: dict = {}            # wristview count per batch item
+        self._committed_v0: dict = {}  # whether agentview has been committed
+        self._committed_v1: dict = {}  # whether wristview has been committed
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        for b in range(input_ids.shape[0]):
+            last = input_ids[b, -1].item()
+            is_av    = self._av_start <= last < self._av_end
+            is_wrist = self._av_end   <= last < self._wrist_end
+
+            if not (is_av or is_wrist):
+                # 非 VRT：块结束，重置所有状态
+                self._c0[b] = 0
+                self._c1[b] = 0
+                self._committed_v0[b] = False
+                self._committed_v1[b] = False
+                continue
+
+            # 更新计数与 committed 标记
+            if is_av:
+                self._c0[b] = self._c0.get(b, 0) + 1
+                self._committed_v0[b] = True
+            else:
+                self._c1[b] = self._c1.get(b, 0) + 1
+                self._committed_v1[b] = True
+
+            c0 = self._c0.get(b, 0)
+            c1 = self._c1.get(b, 0)
+            committed_v0 = self._committed_v0.get(b, False)
+            committed_v1 = self._committed_v1.get(b, False)
+
+            # 上限约束：某视角已满则禁止继续生成该视角
+            if c0 >= self._n:
+                scores[b, self._av_start:self._av_end] = float('-inf')
+            if c1 >= self._n:
+                scores[b, self._av_end:self._wrist_end] = float('-inf')
+
+            # 强制续生成：任意 committed 视角未满，禁止非 VRT token
+            any_incomplete = (
+                (committed_v0 and c0 < self._n) or
+                (committed_v1 and c1 < self._n)
+            )
+            if any_incomplete:
+                scores[b, :self._av_start] = float('-inf')
+                scores[b, self._wrist_end:] = float('-inf')
+
+        return scores
+
 
 ####################################################
 # ⚠️ Warning: This framework has been restructured and is NOT compatible with checkpoints created before 2025-10-20.
@@ -380,10 +485,11 @@ class PaDT_PI(baseframework):
                         f"global_patches={selected_patches_global[:preview_n].tolist()}"
                     )
 
-                # Per-view center selection:
-                # choose one center patch for each available view (agent/wrist).
-                pick_idx_list = []
-                # 每个视角单独处理
+                # Per-view random selection: pick N_PICK patches per view.
+                # Priority: centre patches first, then edge patches to fill up,
+                # allow repeats only when total patches < N_PICK.
+                N_PICK = 3
+                view_pick_indices = {}  # {view_id: np.array of chosen indices into selected_patches}
                 for view_id in sorted(np.unique(selected_patch_view_ids).tolist()):
                     view_mask = selected_patch_view_ids == view_id
                     view_indices = np.where(view_mask)[0]
@@ -399,22 +505,49 @@ class PaDT_PI(baseframework):
                     bottom_m = view_y == view_y.max()
                     centre_m = (left_m + right_m + top_m + bottom_m) == 0
 
-                    centre_local = np.where(centre_m)[0]
-                    if centre_local.size == 0:
+                    strict_centre = np.where(centre_m)[0]
+                    edge_local = np.where(~centre_m)[0]
+                    # If no strict centre patches, treat all as centre (original fallback)
+                    if strict_centre.size == 0:
                         centre_local = np.arange(view_indices.size)
+                        edge_local = np.array([], dtype=np.int64)
+                    else:
+                        centre_local = strict_centre
 
-                    chosen_local = np.random.choice(centre_local)
-                    pick_idx_list.append(view_indices[chosen_local])
+                    total = view_indices.size
+                    if total >= N_PICK:
+                        if centre_local.size >= N_PICK:
+                            # Case 1: enough centre patches → sample without replacement
+                            chosen_locals = np.random.choice(centre_local, size=N_PICK, replace=False)
+                        else:
+                            # Case 2: centre not enough, supplement from edge without replacement
+                            need = N_PICK - centre_local.size
+                            edge_chosen = np.random.choice(edge_local, size=need, replace=False)
+                            chosen_locals = np.concatenate([centre_local, edge_chosen])
+                    else:
+                        # Case 3: total patches < N_PICK → sample with replacement (allow duplicates)
+                        chosen_locals = np.random.choice(np.arange(total), size=N_PICK, replace=True)
 
+                    view_pick_indices[view_id] = view_indices[chosen_locals]
 
-                pick_idx = np.array(pick_idx_list, dtype=np.int64)
+                # Interleave picks across views: [V0_0, V1_0, V0_1, V1_1, V0_2, V1_2]
+                # Matches VRTViewConstraintProcessor which enforces alternating views at inference.
+                sorted_view_ids = sorted(view_pick_indices.keys())
+                if len(sorted_view_ids) > 1:
+                    v_arrays = [view_pick_indices[v] for v in sorted_view_ids]
+                    pick_idx = np.empty(sum(len(a) for a in v_arrays), dtype=np.int64)
+                    for i, arr in enumerate(v_arrays):
+                        pick_idx[i::len(v_arrays)] = arr
+                else:
+                    pick_idx = view_pick_indices[sorted_view_ids[0]]
+                pick_idx = np.array(pick_idx, dtype=np.int64)
                 pick_patch_local = selected_patches[pick_idx]
                 pick_patch = selected_patches_global[pick_idx]
-            
+
                 obj_['patches'] = selected_patches_global
                 obj_['picked'] = pick_patch
                 obj_['picked_local'] = pick_patch_local
-                obj_['picked_view_ids'] = selected_patch_view_ids[pick_idx]
+                obj_['picked_view_ids'] = selected_patch_view_ids
                 new_objs.append(obj_)
                 if debug_this_step and idx < self.debug_vrt_visualize_max_samples:
                     sample_vis_records.append(
@@ -424,13 +557,13 @@ class PaDT_PI(baseframework):
                             "candidate_local": selected_patches.tolist(),
                             "candidate_view_ids": selected_patch_view_ids.tolist(),
                             "picked_local": pick_patch_local.tolist(),
-                            "picked_view_ids": selected_patch_view_ids[pick_idx].tolist(),
+                            "picked_view_ids": selected_patch_view_ids.tolist(),
                         }
                     )
                 if debug_this_step and idx == 0:
                     self._vrt_log(
                         f"obj={obj_str} picked_local={pick_patch_local.tolist()} "
-                        f"picked_global={pick_patch.tolist()} picked_view_ids={selected_patch_view_ids[pick_idx].tolist()}"
+                        f"picked_global={pick_patch.tolist()} picked_view_ids={selected_patch_view_ids.tolist()}"
                     )
                 completion_with_vrt += self.padt_vl_interface.processor.pid2vrt(pick_patch) + completion_part
 
@@ -535,7 +668,7 @@ class PaDT_PI(baseframework):
         if len(loss_masks) == 0:
             if debug_this_step:
                 self._vrt_log("no valid objects for VLM loss in this batch -> return None")
-            return None
+            return None, None
 
         # Keep VP-only mask first; full-vocab padding will be aligned to runtime logits size later.
         loss_masks = torch.cat(loss_masks, dim=0)
@@ -665,7 +798,7 @@ class PaDT_PI(baseframework):
         #     score_loss = 0.
 
         #loss = sft_loss.mean() + bbox_loss + score_loss + mask_loss
-        return sft_loss.mean()
+        return sft_loss.mean(), model_output.hidden_states
 
 
     def forward(
@@ -701,20 +834,55 @@ class PaDT_PI(baseframework):
         
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
         
-        # Step 1: QWenVL input format (for action prediction, no solutions needed)
-        padt_inputs = self.padt_vl_interface.build_padtvl_inputs(
-            images=batch_images, 
-            instructions=instructions,
-        )
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            padt_outputs = self.padt_vl_interface(
-                **padt_inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
+        # compute_vlm_loss=True: 单次共享 VLM forward（训练推理对齐，无需两次 forward）
+        if compute_vlm_loss:
+            # 用统一模板格式化 instruction，训练和推理使用相同 prompt 格式
+            vlm_instructions = [
+                f"Task: {instr}. Identify the key objects."
+                for instr in instructions
+            ]
+            padt_vlm_inputs = self.padt_vl_interface.build_padtvl_vlm_inputs(
+                images=batch_images,
+                vlm_instructions=vlm_instructions,
             )
-            # 取与 DiT 层数匹配的最后 N 层隐藏态，按层喂给 DiT
-            all_hidden = padt_outputs.hidden_states
+            model = self.padt_vl_interface.model
+            # 单次 forward：vlm_loss 和 hidden_states 同时获得
+            vlm_loss_val, all_hidden = self.compute_vlm_loss(
+                model, examples, batch_images, padt_vlm_inputs
+            )
+            if vlm_loss_val is None:
+                # 该 batch 无有效分割标注，fallback 到 action-only forward
+                if self._vrt_debug_this_step():
+                    self._vrt_log("compute_vlm_loss returned None, fallback to action-only forward")
+                padt_inputs = self.padt_vl_interface.build_padtvl_inputs(
+                    images=batch_images,
+                    instructions=instructions,
+                )
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    padt_outputs = self.padt_vl_interface(
+                        **padt_inputs,
+                        output_attentions=False,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    all_hidden = padt_outputs.hidden_states
+        else:
+            # compute_vlm_loss=False: action-only forward（原逻辑不变）
+            padt_inputs = self.padt_vl_interface.build_padtvl_inputs(
+                images=batch_images,
+                instructions=instructions,
+            )
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                padt_outputs = self.padt_vl_interface(
+                    **padt_inputs,
+                    output_attentions=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                all_hidden = padt_outputs.hidden_states
+
+        # 提取与 DiT 层数匹配的最后 N 层隐藏态（compute_vlm_loss=True/False 共用）
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             expected_layers = len(self.action_model.model.transformer_blocks)
             # detach VLM features for action head: action loss only trains DiT,
             # VLM loss only trains VLM — prevents gradient conflict
@@ -725,7 +893,7 @@ class PaDT_PI(baseframework):
                 vl_embs_list = list(all_hidden[-expected_layers:])
             base_hidden = vl_embs_list[-1]
 
-        # Step 4: Action Expert Forward and Loss
+        # Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
             # 标签对齐：取最后 chunk_len 段
             actions = torch.tensor(
@@ -739,7 +907,7 @@ class PaDT_PI(baseframework):
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             # 对每层特征做 repeat
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]
-            
+
             state_repeated = None
             if state is not None:
                 state = torch.tensor(
@@ -751,32 +919,9 @@ class PaDT_PI(baseframework):
 
         # 构建返回字典
         output_dict = {"action_loss": action_loss}
-        
-        # 计算 VLM loss（如果需要且数据可用）
-        if compute_vlm_loss:
-            # 释放 action path 的中间变量，腾出 GPU 显存给 VLM loss forward
-            del padt_inputs, padt_outputs, all_hidden, vl_embs_list, base_hidden
-            del vl_embs_list_repeated, actions_target_repeated, actions_target
-            if state_repeated is not None:
-                del state_repeated
-            torch.cuda.empty_cache()
-            vlm_instructions = [
-                (ex.get("answers", {}).get("conversations", [{}])[0].get("value", "")
-                if ex.get("answers", {}).get("conversations")
-                else ex.get("lang", ex.get("language", "")))
-                for ex in examples
-            ]
-            padt_vlm_inputs = self.padt_vl_interface.build_padtvl_vlm_inputs(
-                images=batch_images,
-                vlm_instructions=vlm_instructions,
-            )
-            model = self.padt_vl_interface.model
-            vlm_loss = self.compute_vlm_loss(model, examples, batch_images, padt_vlm_inputs)
-            if vlm_loss is not None: 
-                output_dict["vlm_loss"] = vlm_loss
-            elif self._vrt_debug_this_step():
-                self._vrt_log("compute_vlm_loss returned None for this batch")
-        
+        if compute_vlm_loss and vlm_loss_val is not None:
+            output_dict["vlm_loss"] = vlm_loss_val
+
         return output_dict
 
 
@@ -785,7 +930,10 @@ class PaDT_PI(baseframework):
     def predict_action( # TODO align  predict_action with forward, make api more flexible
         self,
         examples: List[dict] = None,
-        **kwargs: str,
+        save_patch_vis: bool = False,
+        vis_save_dir: str = None,
+        vis_filename: str = None,
+        **kwargs,
     ) -> np.ndarray:
         """
         推理：单次前向直接回归未来动作（无扩散采样）。
@@ -814,11 +962,104 @@ class PaDT_PI(baseframework):
                 train_obs_image_size = (train_obs_image_size, train_obs_image_size)
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
     
-        # Step 1: PaDT VL input format (use padt_vl_interface)
-        padt_inputs = self.padt_vl_interface.build_padtvl_inputs(images=batch_images, instructions=instructions)
+        # Step 1: 用 raw instruction 生成 VRT completion（两步推理，训练推理对齐）
+        # 与训练时相同的模板格式化
+        vlm_instructions = [
+            f"Task: {instr}. Identify the key objects."
+            for instr in instructions
+        ]
+        # build_padtvl_inputs 返回 tokenized BatchFeature dict（可 ** 解包）
+        # build_padtvl_vlm_inputs 只返回字符串列表，不能用于 generate()
+        prompt_inputs = self.padt_vl_interface.build_padtvl_inputs(
+            images=batch_images,
+            instructions=vlm_instructions,
+        )
+
+        # 构建视角约束 processor（每视角最多 N_PICK 个 VRT token，不同视角独立计数）
+        grid_thw = prompt_inputs["image_grid_thw"].cpu().tolist()
+        num_av_patches = int(grid_thw[0][1]) * int(grid_thw[0][2])
+        num_wrist_patches = int(grid_thw[1][1]) * int(grid_thw[1][2]) if len(grid_thw) > 1 else 0
+        n_pick = getattr(self.config.trainer, "n_vrt_per_block", 3)  # N_PICK per view, must match training
+        vrt_count_constraint = PerViewCountConstraintProcessor(
+            tokenizer=self.padt_vl_interface.processor.tokenizer,
+            num_agentview_patches=num_av_patches,
+            num_wrist_patches=num_wrist_patches,
+            n_pick=n_pick,
+        )
+        logits_processors = [vrt_count_constraint]
+
+        generated_ids = self.padt_vl_interface.generate(
+            **prompt_inputs,
+            max_new_tokens=64,
+            do_sample=False,
+            logits_processor=logits_processors,
+        )
+
+        # 诊断日志：查看 VLM 实际生成了什么 VRT token
+        prompt_length = prompt_inputs["input_ids"].shape[1]
+        first_completion = self.padt_vl_interface.processor.tokenizer.decode(
+            generated_ids[0][prompt_length:], skip_special_tokens=False
+        )
+        vrt_count = first_completion.count("<|VRT_")
+        logger.info(
+            "VRT inference: completion[0]=%r  VRT_token_count=%d",
+            first_completion[:300], vrt_count
+        )
+
+        # ---- Patch 可视化（每10步，由 client 侧控制触发） ----
+        if save_patch_vis and vis_save_dir and vis_filename:
+            import re as _re
+            import os as _os
+            from PIL import ImageDraw
+
+            # 解析 completion 里所有 VRT 索引
+            vrt_indices = [int(m.group(1)) for m in _re.finditer(r'<\|VRT_(\d+)\|>', first_completion)]
+
+            # image_grid_thw: [N_img, 3] = (T, H_patches, W_patches)
+            grid_thw = prompt_inputs["image_grid_thw"].cpu().tolist()
+            patch_counts = [int(g[1]) * int(g[2]) for g in grid_thw]   # e.g. [256, 256]
+            cum = [0] + list(np.cumsum(patch_counts))                   # e.g. [0, 256, 512]
+
+            # batch_images[0] = [agentview_PIL, wrist_PIL]
+            img_names = ["agentview", "wrist"]
+            images_copy = [img.copy() for img in batch_images[0]]
+            draws = [ImageDraw.Draw(img) for img in images_copy]
+            COLORS = ["red", "blue", "green", "yellow", "orange", "cyan"]
+
+            for color_i, vrt_k in enumerate(vrt_indices):
+                color = COLORS[color_i % len(COLORS)]
+                for img_i in range(len(grid_thw)):
+                    if cum[img_i] <= vrt_k < cum[img_i + 1]:
+                        local_k = vrt_k - cum[img_i]
+                        h_p = int(grid_thw[img_i][1])   # patch 行数
+                        w_p = int(grid_thw[img_i][2])   # patch 列数
+                        row = local_k // w_p
+                        col = local_k % w_p
+                        img_w, img_h = images_copy[img_i].size
+                        px = img_w // w_p               # 每 patch 像素宽
+                        py = img_h // h_p               # 每 patch 像素高
+                        x0, y0 = col * px, row * py
+                        x1, y1 = x0 + px, y0 + py
+                        draws[img_i].rectangle([x0, y0, x1, y1], outline=color, width=2)
+                        draws[img_i].text((x0 + 2, y0 + 2), str(vrt_k), fill=color)
+                        break
+
+            _os.makedirs(vis_save_dir, exist_ok=True)
+            for img, name in zip(images_copy, img_names):
+                save_path = _os.path.join(vis_save_dir, f"{vis_filename}_{name}.png")
+                img.save(save_path)
+            logger.info("Patch vis saved: %s/%s_*.png", vis_save_dir, vis_filename)
+
+        # Step 2: 直接用 generated_ids 做第二次 VLM forward
+        # 避免 decode+re-encode 的格式问题：build_padtvl_inputs 的 add_generation_prompt=True
+        # 在 assistant 消息后会额外插入 <|im_start|>assistant\n，与训练序列格式不一致。
+        # generated_ids 已包含完整的 [prompt + 生成 VRT tokens]，格式与 compute_vlm_loss 训练一致。
         with torch.autocast("cuda", dtype=torch.bfloat16):
             padtvl_outputs = self.padt_vl_interface(
-                **padt_inputs,
+                input_ids=generated_ids,
+                attention_mask=torch.ones(generated_ids.shape, dtype=torch.long, device=generated_ids.device),
+                pixel_values=prompt_inputs["pixel_values"],
+                image_grid_thw=prompt_inputs["image_grid_thw"],
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
