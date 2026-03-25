@@ -478,9 +478,18 @@ class VLATrainer(TrainerUtils):
                     vlm_loss = output_dict["vlm_loss"]
                     vlm_loss_scale = self.config.trainer.loss_scale.vlm
                     total_loss = action_loss + vlm_loss * vlm_loss_scale
-                    log_dict["vlm_loss"] = vlm_loss.item()
+                    log_dict["vlm_loss"] = vlm_loss.item()          # hybrid loss（用于 backward）
                     log_dict["vlm_loss_weighted"] = (vlm_loss * vlm_loss_scale).item()
                     log_dict["total_loss"] = total_loss.item()
+                    # VRT-only metrics
+                    m = output_dict.get("vrt_metrics")
+                    if m is not None:
+                        log_dict["sft_loss"] = m["sft_loss"].item()
+                        log_dict["vrt_ce"] = m["vrt_ce"].item()
+                        log_dict["vrt_acc_raw"] = m["vrt_acc_raw"].item()
+                        log_dict["vrt_acc_in_bbox"] = m["vrt_acc_in_bbox"].item()
+                        log_dict["vrt_acc_masked"] = m["vrt_acc_masked"].item()
+                        log_dict["num_vrt_tokens"] = m["num_vrt_tokens"]
                 else:
                     total_loss = action_loss
                     log_dict["total_loss"] = action_loss.item()

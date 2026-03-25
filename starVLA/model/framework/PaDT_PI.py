@@ -185,13 +185,7 @@ class PaDT_PI(baseframework):
             if merge_size < 1:
                 raise ValueError(f"Invalid spatial_merge_size={merge_size}, expected >= 1")
 
-            max_vrt_patches = qwenvl_cfg.get("max_vrt_patches", None) if qwenvl_cfg is not None else None
-            if max_vrt_patches is None:
-                # conservative default: 4096 visual patches per sample
-                max_vrt_patches = 4096
-            max_vrt_patches = int(max_vrt_patches)
-
-            # Minimum required VRT patches for one sample (default assumes 2 views for PaDTPI).
+            # Compute per-image patch count from image_size and spatial_merge_size.
             image_size_cfg = getattr(getattr(getattr(self.config, "datasets", None), "vla_data", None), "image_size", 224)
             if isinstance(image_size_cfg, (list, tuple)):
                 image_size = int(image_size_cfg[0])
@@ -199,12 +193,20 @@ class PaDT_PI(baseframework):
                 image_size = int(image_size_cfg)
             patches_per_side = max(1, image_size // 14)
             per_image_vrt_patches = max(1, (patches_per_side * patches_per_side) // (merge_size ** 2))
+            # images_per_sample = actual number of views fed to the VLM (from framework.qwenvl.images_per_sample)
+            # NOTE: num_views in datasets.vla_data controls VRT patch TARGET selection only, not VLM input count
             images_per_sample = int(qwenvl_cfg.get("images_per_sample", 2)) if qwenvl_cfg is not None else 2
+            # auto-compute min_required and max from images_per_sample; YAML values are optional overrides
+            _auto_patches = per_image_vrt_patches * images_per_sample
             min_required_vrt_patches = (
-                int(qwenvl_cfg.get("min_required_vrt_patches", per_image_vrt_patches * images_per_sample))
+                int(qwenvl_cfg.get("min_required_vrt_patches", _auto_patches))
                 if qwenvl_cfg is not None
-                else per_image_vrt_patches * images_per_sample
+                else _auto_patches
             )
+            max_vrt_patches = qwenvl_cfg.get("max_vrt_patches", None) if qwenvl_cfg is not None else None
+            if max_vrt_patches is None:
+                max_vrt_patches = _auto_patches
+            max_vrt_patches = int(max_vrt_patches)
             if max_vrt_patches < min_required_vrt_patches:
                 msg = (
                     f"max_vrt_patches={max_vrt_patches} is smaller than minimum required "
@@ -371,7 +373,7 @@ class PaDT_PI(baseframework):
         canvas.save(save_path)
         return save_path
 
-    def compute_vlm_loss(self, model, examples: List[dict], batch_images :List[List[PIL.Image.Image]], padt_vlm_inputs: List[dict]) -> Optional[torch.Tensor]:
+    def compute_vlm_loss(self, model, examples: List[dict], batch_images :List[List[PIL.Image.Image]], padt_vlm_inputs: List[dict], vrt_lambda: float = 0.5) -> Optional[torch.Tensor]:
         
         prompt_text = padt_vlm_inputs
         debug_this_step = self._vrt_debug_this_step()
@@ -397,7 +399,11 @@ class PaDT_PI(baseframework):
 
             # completion
             im_w, im_h = batch_images[idx][0].size
-            patch_w, patch_h = round(im_w / 14), round(im_h / 14)
+            _merge_size = int(getattr(
+                getattr(self.padt_vl_interface.model.config, "vision_config", None),
+                "spatial_merge_size", 1
+            ))
+            patch_w, patch_h = round(im_w / (14 * _merge_size)), round(im_h / (14 * _merge_size))
 
             solution = x.get('answers', {})
             completion = solution.get('answer_template', "")
@@ -413,8 +419,13 @@ class PaDT_PI(baseframework):
             if isinstance(seg, list):
                 seg = seg[0] if len(seg) > 0 else {}
             seg = seg if isinstance(seg, dict) else {}
+            # 读取 num_views，决定是否使用 wrist 视角的 seg 数据
+            _num_views = getattr(
+                getattr(getattr(self.config, "datasets", None), "vla_data", None),
+                "num_views", 2
+            )
             agentview_seg = seg.get('agentview_bbox_mask', {})
-            wrist_seg = seg.get('wrist_bbox_mask', {})
+            wrist_seg = seg.get('wrist_bbox_mask', {}) if _num_views >= 2 else {}
             agent_objs = [agentview_seg.get(str(i[1])) for i in obj_in_completion]
             wrist_objs = [wrist_seg.get(str(i[1])) for i in obj_in_completion]
             merged_objs = []
@@ -608,9 +619,8 @@ class PaDT_PI(baseframework):
             'image_grid_thw': prompt_inputs['image_grid_thw'],
             'pixel_values': prompt_inputs['pixel_values']
         }
-        # trainer_cfg = getattr(self.config, "trainer", None)
-        # use_sft_vp_mask = bool(getattr(trainer_cfg, "use_sft_vp_mask", False))
-        use_sft_vp_mask = True
+        trainer_cfg = getattr(self.config, "trainer", None)
+        use_sft_vp_mask = bool(getattr(trainer_cfg, "use_sft_vp_mask", True))
         model_embed_token_size = int(
             getattr(self.padt_vl_interface.processor, "model_embed_token_size", get_input_embedding_vocab_size(model))
         )
@@ -679,6 +689,10 @@ class PaDT_PI(baseframework):
         # Concatenate for full sequence
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        # FlashAttention2 requires no trailing zeros in attention_mask.
+        # cummax propagates 1s rightward, eliminating right-padding zeros while
+        # preserving left-padding zeros. Loss is still gated by completion_mask.
+        attention_mask = attention_mask.cummax(dim=1).values
         pre_global_ids = input_ids.clone() if debug_this_step else None
 
         input_ids = self.padt_vl_interface.processor.assign_to_global_vrt_id(
@@ -714,8 +728,33 @@ class PaDT_PI(baseframework):
                 f"images_per_sample={images_per_sample}"
             )
 
+        # loss_masks 提前 pad（in_bbox 指标和 logit masking 均需要）
+        loss_masks = torch.nn.functional.pad(loss_masks, (model_embed_token_size, 0), 'constant', False)
+
+        # ---- VRT mask & raw accuracy（在 VP mask 之前，logits 未被 mask）----
+        vrt_mask = (input_ids >= model_embed_token_size) & completion_mask.bool()  # (B, L), bool
+        num_vrt_tokens = int(vrt_mask.sum().item())
+
+        if num_vrt_tokens == 0:
+            logger.warning("compute_vlm_loss: num_vrt_tokens=0 in this batch, VRT metrics skipped.")
+            vrt_acc_raw = torch.tensor(float('nan'), device=logits.device)
+            vrt_acc_in_bbox = torch.tensor(float('nan'), device=logits.device)
+        else:
+            with torch.no_grad():
+                pred_ids_raw = logits.argmax(dim=-1)  # (B, L)
+                vrt_acc_raw = ((pred_ids_raw == input_ids) & vrt_mask).sum().float() / num_vrt_tokens
+                # ---- vrt_acc_in_bbox：预测的 patch 落在 GT bbox 区域内即算正确
+                # loss_masks[i, j]=True 表示 patch j 是 bbox 候选区但非 GT picked → 也算有效
+                pred_flat = pred_ids_raw[vrt_mask]   # [num_vrt_tokens]
+                gt_flat   = input_ids[vrt_mask]      # [num_vrt_tokens]
+                safe_pred = pred_flat.clamp(0, loss_masks.shape[1] - 1)
+                pred_in_bbox_not_gt = loss_masks[torch.arange(num_vrt_tokens, device=device), safe_pred]
+                pred_is_exact_gt    = (pred_flat == gt_flat)
+                pred_is_patch       = (pred_flat >= model_embed_token_size)
+                vrt_acc_in_bbox = (pred_is_patch & (pred_is_exact_gt | pred_in_bbox_not_gt)).float().mean()
+
         if use_sft_vp_mask:
-            loss_masks = torch.nn.functional.pad(loss_masks, (model_embed_token_size, 0), 'constant', False)
+            # loss_masks 已在上方 pad，直接用
             visual_patch_mask = input_ids >= model_embed_token_size
             logits[visual_patch_mask] = logits[visual_patch_mask].masked_fill(loss_masks, float('-inf'))
             if debug_this_step:
@@ -724,7 +763,19 @@ class PaDT_PI(baseframework):
                     f"loss_masks_shape={tuple(loss_masks.shape)} logits_shape={tuple(logits.shape)} "
                     f"model_embed_token_size={model_embed_token_size}"
                 )
-        
+
+        # ---- vrt_acc_masked：在 VP-masked logits 上计算（只在 candidate patches 中选）
+        # 若 use_sft_vp_mask==False，masked==raw；若 num_vrt_tokens==0，置 nan
+        if num_vrt_tokens > 0:
+            if use_sft_vp_mask:
+                with torch.no_grad():
+                    pred_ids_masked = logits.argmax(dim=-1)  # (B, L)
+                    vrt_acc_masked = ((pred_ids_masked == input_ids) & vrt_mask).sum().float() / num_vrt_tokens
+            else:
+                vrt_acc_masked = vrt_acc_raw  # 无 VP mask 时 masked == raw
+        else:
+            vrt_acc_masked = torch.tensor(float('nan'), device=logits.device)
+
         # # decode to bbox
         # hidden_states = torch.stack(model_output.hidden_states, dim=1)[:, -1:, prompt_length-1:-1].permute(2, 1, 0, 3).unsqueeze(dim=-2).contiguous() # [BS, Layers, N, Dim] -> [N, Layers, BS, 1, D]
         # completions, feats, labels, vps, vps_feats = parseVRTintoCompletion(self.padt_vl_interface.processor, completion_ids, hidden_states, torch.tensor([False] * batch_size), model_output.past_image_embeds, multimodal_inputs['image_grid_thw']) # hidden_states: [N, Layers, BS, D]
@@ -767,13 +818,30 @@ class PaDT_PI(baseframework):
                 f"sft_loss_mean={float(sft_loss.detach().mean().item()):.6f} "
                 f"completion_valid_tokens={completion_mask.sum(dim=-1).tolist()}"
             )
+        # VRT-only CE + hybrid loss
+        if num_vrt_tokens > 0:
+            vrt_ce = ((per_token_loss * vrt_mask).sum(dim=-1) / (vrt_mask.sum(dim=-1) + 1e-4)).to(logits.dtype)
+            hybrid_loss = (1.0 - vrt_lambda) * sft_loss + vrt_lambda * vrt_ce
+        else:
+            # num_vrt_tokens==0 时退化为纯 SFT，不打折
+            vrt_ce = sft_loss.detach() * 0.
+            hybrid_loss = sft_loss
+
         if hasattr(self, "_metrics") and isinstance(self._metrics, dict):
-            if hasattr(self, "accelerator") and self.accelerator is not None:
-                sft_loss_metric = self.accelerator.gather_for_metrics(sft_loss).mean().item()
-            else:
-                sft_loss_metric = sft_loss.detach().mean().item()
-            self._metrics.setdefault('sft_loss', []).append(sft_loss_metric)
-        
+            _gather = (self.accelerator.gather_for_metrics
+                       if (hasattr(self, "accelerator") and self.accelerator is not None)
+                       else lambda x: x)
+            self._metrics.setdefault('sft_loss', []).append(_gather(sft_loss).mean().item())
+            self._metrics.setdefault('vrt_ce', []).append(_gather(vrt_ce).mean().item())
+            self._metrics.setdefault('vrt_acc_raw', []).append(_gather(vrt_acc_raw).mean().item())
+            self._metrics.setdefault('vrt_acc_in_bbox', []).append(_gather(vrt_acc_in_bbox).mean().item())
+            self._metrics.setdefault('vrt_acc_masked', []).append(_gather(vrt_acc_masked).mean().item())
+            self._metrics.setdefault('num_vrt_tokens', []).append(num_vrt_tokens)
+            # vrt_ratio：batch-level = 整个 batch 中 VRT token 数 / 有效 completion token 总数
+            total_valid_completion = int(completion_mask.bool().sum().item())
+            vrt_ratio = num_vrt_tokens / max(1, total_valid_completion)
+            self._metrics.setdefault('vrt_ratio', []).append(vrt_ratio)
+
         # if self.args.use_bbox_loss:
         #     # bbox loss
         #     pred_bboxes = decoded_list['pred_boxes']  # num_bbox, 4 [cx, cy, w, h]
@@ -798,7 +866,14 @@ class PaDT_PI(baseframework):
         #     score_loss = 0.
 
         #loss = sft_loss.mean() + bbox_loss + score_loss + mask_loss
-        return sft_loss.mean(), model_output.hidden_states
+        return hybrid_loss.mean(), {
+            'sft_loss': sft_loss.mean(),
+            'vrt_ce': vrt_ce.mean(),
+            'vrt_acc_raw': vrt_acc_raw,
+            'vrt_acc_in_bbox': vrt_acc_in_bbox,
+            'vrt_acc_masked': vrt_acc_masked,
+            'num_vrt_tokens': num_vrt_tokens,
+        }, model_output.hidden_states
 
 
     def forward(
@@ -846,9 +921,14 @@ class PaDT_PI(baseframework):
                 vlm_instructions=vlm_instructions,
             )
             model = self.padt_vl_interface.model
+            # 读取 vrt_lambda（默认 0.5），用于混合 sft_loss 和 vrt_ce
+            vrt_lambda = getattr(
+                getattr(getattr(self.config, "trainer", None), "loss_scale", None),
+                "vrt_lambda", 0.5
+            )
             # 单次 forward：vlm_loss 和 hidden_states 同时获得
-            vlm_loss_val, all_hidden = self.compute_vlm_loss(
-                model, examples, batch_images, padt_vlm_inputs
+            vlm_loss_val, vrt_metrics, all_hidden = self.compute_vlm_loss(
+                model, examples, batch_images, padt_vlm_inputs, vrt_lambda=vrt_lambda
             )
             if vlm_loss_val is None:
                 # 该 batch 无有效分割标注，fallback 到 action-only forward
@@ -920,7 +1000,8 @@ class PaDT_PI(baseframework):
         # 构建返回字典
         output_dict = {"action_loss": action_loss}
         if compute_vlm_loss and vlm_loss_val is not None:
-            output_dict["vlm_loss"] = vlm_loss_val
+            output_dict["vlm_loss"] = vlm_loss_val      # hybrid loss，用于 backward
+            output_dict["vrt_metrics"] = vrt_metrics    # dict，用于 logging
 
         return output_dict
 
@@ -961,113 +1042,140 @@ class PaDT_PI(baseframework):
             if isinstance(train_obs_image_size, int):
                 train_obs_image_size = (train_obs_image_size, train_obs_image_size)
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
-    
-        # Step 1: 用 raw instruction 生成 VRT completion（两步推理，训练推理对齐）
-        # 与训练时相同的模板格式化
-        vlm_instructions = [
-            f"Task: {instr}. Identify the key objects."
-            for instr in instructions
-        ]
-        # build_padtvl_inputs 返回 tokenized BatchFeature dict（可 ** 解包）
-        # build_padtvl_vlm_inputs 只返回字符串列表，不能用于 generate()
-        prompt_inputs = self.padt_vl_interface.build_padtvl_inputs(
-            images=batch_images,
-            instructions=vlm_instructions,
-        )
 
-        # 构建视角约束 processor（每视角最多 N_PICK 个 VRT token，不同视角独立计数）
-        grid_thw = prompt_inputs["image_grid_thw"].cpu().tolist()
-        num_av_patches = int(grid_thw[0][1]) * int(grid_thw[0][2])
-        num_wrist_patches = int(grid_thw[1][1]) * int(grid_thw[1][2]) if len(grid_thw) > 1 else 0
-        n_pick = getattr(self.config.trainer, "n_vrt_per_block", 3)  # N_PICK per view, must match training
-        vrt_count_constraint = PerViewCountConstraintProcessor(
-            tokenizer=self.padt_vl_interface.processor.tokenizer,
-            num_agentview_patches=num_av_patches,
-            num_wrist_patches=num_wrist_patches,
-            n_pick=n_pick,
-        )
-        logits_processors = [vrt_count_constraint]
-
-        generated_ids = self.padt_vl_interface.generate(
-            **prompt_inputs,
-            max_new_tokens=64,
-            do_sample=False,
-            logits_processor=logits_processors,
-        )
-
-        # 诊断日志：查看 VLM 实际生成了什么 VRT token
-        prompt_length = prompt_inputs["input_ids"].shape[1]
-        first_completion = self.padt_vl_interface.processor.tokenizer.decode(
-            generated_ids[0][prompt_length:], skip_special_tokens=False
-        )
-        vrt_count = first_completion.count("<|VRT_")
-        logger.info(
-            "VRT inference: completion[0]=%r  VRT_token_count=%d",
-            first_completion[:300], vrt_count
-        )
-
-        # ---- Patch 可视化（每10步，由 client 侧控制触发） ----
-        if save_patch_vis and vis_save_dir and vis_filename:
-            import re as _re
-            import os as _os
-            from PIL import ImageDraw
-
-            # 解析 completion 里所有 VRT 索引
-            vrt_indices = [int(m.group(1)) for m in _re.finditer(r'<\|VRT_(\d+)\|>', first_completion)]
-
-            # image_grid_thw: [N_img, 3] = (T, H_patches, W_patches)
-            grid_thw = prompt_inputs["image_grid_thw"].cpu().tolist()
-            patch_counts = [int(g[1]) * int(g[2]) for g in grid_thw]   # e.g. [256, 256]
-            cum = [0] + list(np.cumsum(patch_counts))                   # e.g. [0, 256, 512]
-
-            # batch_images[0] = [agentview_PIL, wrist_PIL]
-            img_names = ["agentview", "wrist"]
-            images_copy = [img.copy() for img in batch_images[0]]
-            draws = [ImageDraw.Draw(img) for img in images_copy]
-            COLORS = ["red", "blue", "green", "yellow", "orange", "cyan"]
-
-            for color_i, vrt_k in enumerate(vrt_indices):
-                color = COLORS[color_i % len(COLORS)]
-                for img_i in range(len(grid_thw)):
-                    if cum[img_i] <= vrt_k < cum[img_i + 1]:
-                        local_k = vrt_k - cum[img_i]
-                        h_p = int(grid_thw[img_i][1])   # patch 行数
-                        w_p = int(grid_thw[img_i][2])   # patch 列数
-                        row = local_k // w_p
-                        col = local_k % w_p
-                        img_w, img_h = images_copy[img_i].size
-                        px = img_w // w_p               # 每 patch 像素宽
-                        py = img_h // h_p               # 每 patch 像素高
-                        x0, y0 = col * px, row * py
-                        x1, y1 = x0 + px, y0 + py
-                        draws[img_i].rectangle([x0, y0, x1, y1], outline=color, width=2)
-                        draws[img_i].text((x0 + 2, y0 + 2), str(vrt_k), fill=color)
-                        break
-
-            _os.makedirs(vis_save_dir, exist_ok=True)
-            for img, name in zip(images_copy, img_names):
-                save_path = _os.path.join(vis_save_dir, f"{vis_filename}_{name}.png")
-                img.save(save_path)
-            logger.info("Patch vis saved: %s/%s_*.png", vis_save_dir, vis_filename)
-
-        # Step 2: 直接用 generated_ids 做第二次 VLM forward
-        # 避免 decode+re-encode 的格式问题：build_padtvl_inputs 的 add_generation_prompt=True
-        # 在 assistant 消息后会额外插入 <|im_start|>assistant\n，与训练序列格式不一致。
-        # generated_ids 已包含完整的 [prompt + 生成 VRT tokens]，格式与 compute_vlm_loss 训练一致。
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            padtvl_outputs = self.padt_vl_interface(
-                input_ids=generated_ids,
-                attention_mask=torch.ones(generated_ids.shape, dtype=torch.long, device=generated_ids.device),
-                pixel_values=prompt_inputs["pixel_values"],
-                image_grid_thw=prompt_inputs["image_grid_thw"],
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
+        _compute_vlm_loss = getattr(getattr(self.config, "trainer", None), "compute_vlm_loss", True)
+        if not _compute_vlm_loss:
+            # no-VRT baseline: 跳过 VRT 生成，直接用 raw instruction 做 VLM forward
+            # 与训练时 compute_vlm_loss=False 的 forward() 路径完全对齐（L930-943）
+            padt_inputs = self.padt_vl_interface.build_padtvl_inputs(
+                images=batch_images,
+                instructions=instructions,  # raw instruction，与训练一致
             )
-            all_hidden = padtvl_outputs.hidden_states
-            expected_layers = len(self.action_model.model.transformer_blocks)
-            vl_embs_list = list(all_hidden[-expected_layers:])
-            base_hidden = vl_embs_list[-1]
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                padtvl_outputs = self.padt_vl_interface(
+                    **padt_inputs,
+                    output_attentions=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                all_hidden = padtvl_outputs.hidden_states
+                expected_layers = len(self.action_model.model.transformer_blocks)
+                vl_embs_list = list(all_hidden[-expected_layers:])
+                base_hidden = vl_embs_list[-1]
+        else:
+            # Step 1: 用 raw instruction 生成 VRT completion（两步推理，训练推理对齐）
+            # 与训练时相同的模板格式化
+            vlm_instructions = [
+                f"Task: {instr}. Identify the key objects."
+                for instr in instructions
+            ]
+            # build_padtvl_inputs 返回 tokenized BatchFeature dict（可 ** 解包）
+            # build_padtvl_vlm_inputs 只返回字符串列表，不能用于 generate()
+            prompt_inputs = self.padt_vl_interface.build_padtvl_inputs(
+                images=batch_images,
+                instructions=vlm_instructions,
+            )
+
+            # 构建视角约束 processor（每视角最多 N_PICK 个 VRT token，不同视角独立计数）
+            grid_thw = prompt_inputs["image_grid_thw"].cpu().tolist()
+            num_av_patches = int(grid_thw[0][1]) * int(grid_thw[0][2])
+            num_wrist_patches = int(grid_thw[1][1]) * int(grid_thw[1][2]) if len(grid_thw) > 1 else 0
+            # num_views controls VRT patch TARGET scope: 1=agentview only, 2=both views
+            # VLM still processes all images; only VRT token generation is restricted
+            _num_vrt_views = getattr(
+                getattr(getattr(self.config, "datasets", None), "vla_data", None),
+                "num_views", 2
+            )
+            num_wrist_patches_for_vrt = num_wrist_patches if _num_vrt_views >= 2 else 0
+            n_pick = getattr(self.config.trainer, "n_vrt_per_block", 3)  # N_PICK per view, must match training
+            vrt_count_constraint = PerViewCountConstraintProcessor(
+                tokenizer=self.padt_vl_interface.processor.tokenizer,
+                num_agentview_patches=num_av_patches,
+                num_wrist_patches=num_wrist_patches_for_vrt,  # 0 if trained with agentview-only VRT
+                n_pick=n_pick,
+            )
+            logits_processors = [vrt_count_constraint]
+
+            generated_ids = self.padt_vl_interface.generate(
+                **prompt_inputs,
+                max_new_tokens=64,
+                do_sample=False,
+                logits_processor=logits_processors,
+            )
+
+            # 诊断日志：查看 VLM 实际生成了什么 VRT token
+            prompt_length = prompt_inputs["input_ids"].shape[1]
+            first_completion = self.padt_vl_interface.processor.tokenizer.decode(
+                generated_ids[0][prompt_length:], skip_special_tokens=False
+            )
+            vrt_count = first_completion.count("<|VRT_")
+            logger.info(
+                "VRT inference: completion[0]=%r  VRT_token_count=%d",
+                first_completion[:300], vrt_count
+            )
+
+            # ---- Patch 可视化（每10步，由 client 侧控制触发） ----
+            if save_patch_vis and vis_save_dir and vis_filename:
+                import re as _re
+                import os as _os
+                from PIL import ImageDraw
+
+                # 解析 completion 里所有 VRT 索引
+                vrt_indices = [int(m.group(1)) for m in _re.finditer(r'<\|VRT_(\d+)\|>', first_completion)]
+
+                # image_grid_thw: [N_img, 3] = (T, H_patches, W_patches)
+                grid_thw = prompt_inputs["image_grid_thw"].cpu().tolist()
+                patch_counts = [int(g[1]) * int(g[2]) for g in grid_thw]   # e.g. [256, 256]
+                cum = [0] + list(np.cumsum(patch_counts))                   # e.g. [0, 256, 512]
+
+                # batch_images[0] = [agentview_PIL, wrist_PIL]
+                img_names = ["agentview", "wrist"]
+                images_copy = [img.copy() for img in batch_images[0]]
+                draws = [ImageDraw.Draw(img) for img in images_copy]
+                COLORS = ["red", "blue", "green", "yellow", "orange", "cyan"]
+
+                for color_i, vrt_k in enumerate(vrt_indices):
+                    color = COLORS[color_i % len(COLORS)]
+                    for img_i in range(len(grid_thw)):
+                        if cum[img_i] <= vrt_k < cum[img_i + 1]:
+                            local_k = vrt_k - cum[img_i]
+                            h_p = int(grid_thw[img_i][1])   # patch 行数
+                            w_p = int(grid_thw[img_i][2])   # patch 列数
+                            row = local_k // w_p
+                            col = local_k % w_p
+                            img_w, img_h = images_copy[img_i].size
+                            px = img_w // w_p               # 每 patch 像素宽
+                            py = img_h // h_p               # 每 patch 像素高
+                            x0, y0 = col * px, row * py
+                            x1, y1 = x0 + px, y0 + py
+                            draws[img_i].rectangle([x0, y0, x1, y1], outline=color, width=2)
+                            draws[img_i].text((x0 + 2, y0 + 2), str(vrt_k), fill=color)
+                            break
+
+                _os.makedirs(vis_save_dir, exist_ok=True)
+                for img, name in zip(images_copy, img_names):
+                    save_path = _os.path.join(vis_save_dir, f"{vis_filename}_{name}.png")
+                    img.save(save_path)
+                logger.info("Patch vis saved: %s/%s_*.png", vis_save_dir, vis_filename)
+
+            # Step 2: 直接用 generated_ids 做第二次 VLM forward
+            # 避免 decode+re-encode 的格式问题：build_padtvl_inputs 的 add_generation_prompt=True
+            # 在 assistant 消息后会额外插入 <|im_start|>assistant\n，与训练序列格式不一致。
+            # generated_ids 已包含完整的 [prompt + 生成 VRT tokens]，格式与 compute_vlm_loss 训练一致。
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                padtvl_outputs = self.padt_vl_interface(
+                    input_ids=generated_ids,
+                    attention_mask=torch.ones(generated_ids.shape, dtype=torch.long, device=generated_ids.device),
+                    pixel_values=prompt_inputs["pixel_values"],
+                    image_grid_thw=prompt_inputs["image_grid_thw"],
+                    output_attentions=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                all_hidden = padtvl_outputs.hidden_states
+                expected_layers = len(self.action_model.model.transformer_blocks)
+                vl_embs_list = list(all_hidden[-expected_layers:])
+                base_hidden = vl_embs_list[-1]
 
         state = torch.from_numpy(np.array(state)).to(base_hidden.device, dtype=base_hidden.dtype) if state is not None else None
         # Step 4: Action Expert Forward and Loss
